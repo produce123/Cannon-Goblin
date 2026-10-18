@@ -483,6 +483,18 @@ async function rejoinRound(frameA, frameB, code, label) {
     say('   编辑器棋盘 ' + editorAlign.boardWidth + 'px / 格子 ' + editorAlign.cellSize + 'px，最大偏差 ' +
       editorAlign.maxDeviation.toFixed(3) + 'px');
 
+    // 站点图标：路径写错 / 文件没跟着发布是最容易犯的错，这里按浏览器解析后的地址真加载一次。
+    const iconHref = docM.querySelector('link[rel="icon"]')?.href;
+    if (!iconHref) throw new Error('index.html 里没有 <link rel="icon">');
+    const iconSize = await new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(img.naturalWidth + '×' + img.naturalHeight);
+      img.onerror = () => resolve(null);
+      img.src = iconHref;
+    });
+    if (!iconSize) throw new Error('站点图标加载失败: ' + iconHref);
+    say('   站点图标 ' + iconSize + ' 可加载 (' + decodeURIComponent(iconHref.split('/').pop()) + ')');
+
     // ---------- 本地 / 人机冒烟 ----------
     say('【本地/人机】 11) 冒烟测试…');
     F.contentWindow.eval('leaveOnline()');

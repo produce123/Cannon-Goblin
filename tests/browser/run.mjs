@@ -1,10 +1,11 @@
 /*
  * 浏览器端 E2E：起一个临时静态服务器 + 一个内置的极简 MQTT broker，
- * 用无头 Chrome/Edge 加载 tests/browser/handshake.html。
- * 该页面会在两个同源 iframe 里各跑一份真实的 index.html，完整走一遍：
- *   在线大厅 → 房主建房拿到房间号 → 加入方输房间号进房 → 双方进准备界面
- *   → 房主选地图开始 → 双方走子同步 → 两条重开路径 → 再跑一遍强制中继模式
- *   → 本地/人机冒烟
+ * 用无头 Chrome/Edge 加载 tests/browser/online.html。
+ * 该页面会在多个同源 iframe 里各跑一份真实的 index.html，完整走一遍：
+ *   在线大厅 → 房主建房拿到房间号 → 加入方输房间号进房 → 房主换边 → 双方进准备界面
+ *   → 房主选地图开始 → 双方走子同步 → 两条重开路径 → 第三人抢号被拒
+ *   → 对手离开后用同一房间号重进 → 再跑一遍强制中继模式（含重进）
+ *   → 手机窄屏下棋子与网格交点的对齐 → 本地/人机（三档难度）冒烟
  * 之所以必须用真浏览器：WebRTC 握手、DataChannel 同步、以及内联 onclick 里被吞掉的
  * async 报错，都只有真环境才暴露得出来。
  *
@@ -41,7 +42,12 @@ if (!browser) {
   process.exit(2);
 }
 
-const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+const TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png'
+};
 
 let child = null;
 let settled = false;

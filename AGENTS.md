@@ -10,6 +10,7 @@
 ```
 index.html          全部界面（菜单 / 设置 / 地图编辑器 / 联机大厅 / 准备界面 / 棋盘 / 规则），
                     单页面切换靠 .screen.active，不用路由
+favicon.png         站点图标（💥，128×128），在 index.html 里同时用作 icon 与 apple-touch-icon
 css/style.css       全部样式，配色走 :root 的 CSS 变量
 js/game.js          PRESET_MAPS 预设地图、EMPTY/CANNON/GHOST 常量、GameState 规则引擎
 js/ai.js            AIPlayer：难度 = 预判步数（简单 1 / 普通 2 / 困难 4），alpha-beta + 时间预算

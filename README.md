@@ -126,6 +126,7 @@ node tests/browser/run.mjs        # 真实浏览器端到端（自动找 Chrome 
 
 ```
 index.html                所有界面（菜单 / 设置 / 编辑器 / 联机大厅 / 准备界面 / 棋盘 / 规则）
+favicon.png               站点图标（💥，128×128）
 css/style.css             所有样式
 js/game.js                规则引擎 GameState + 预设地图
 js/ai.js                  三档 AI

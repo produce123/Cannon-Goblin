@@ -12,7 +12,7 @@ index.html          全部界面（菜单 / 设置 / 地图编辑器 / 联机大
                     单页面切换靠 .screen.active，不用路由
 css/style.css       全部样式，配色走 :root 的 CSS 变量
 js/game.js          PRESET_MAPS 预设地图、EMPTY/CANNON/GHOST 常量、GameState 规则引擎
-js/ai.js            AIPlayer：easy（随机）/ normal（启发式）/ hard（minimax 深度 3）
+js/ai.js            AIPlayer：难度 = 预判步数（简单 1 / 普通 2 / 困难 4），alpha-beta + 时间预算
 js/audio.js         AudioManager：WebAudio 合成音效，无音频资源文件
 js/mqtt.js          极简 MQTT 3.1.1 over WebSocket 客户端（报文编解码 + MqttClient），零依赖手写
 js/room.js          联机房间层：房间号、公共 broker 容错、信令、WebRTC 优先 + 中继降级
@@ -56,15 +56,56 @@ tests/browser/      无头浏览器 E2E（run.mjs 起临时静态服务 + 内置
   ⚠️ **改动 `GameState` 的走子/吃子/胜负规则时，必须保证它在两端表现完全相同**，
   否则联机双方会静默不同步。`tests/game.test.mjs` 里有一条"双方本地重放后局面一致"
   的不变量用例，改规则后请务必跑它。
-- 房主固定执大炮方（先手），加入方执小鬼方；**地图由房主在准备界面决定**
-  （预设 / 自定义尺寸 / 编辑器自由摆放），点开始才把局面下发给加入方。
+- 房主在准备界面选**自己执哪一方**（大炮方先手），加入方自动取另一方；
+  **地图也由房主在准备界面决定**（预设 / 自定义尺寸 / 编辑器自由摆放），
+  点开始才把站位和局面一起下发给加入方。
+  ⚠️ 别再把"房主=大炮方"写死：`playerSide` 由 `app.js` 的 `applyOnlineSide()` 统一算，
+  房主自己的选择在 `onlineHostSide`。判断"谁有权开局/重开"要用**房主身份**
+  （`isOnlineHost()`），不要用 `playerSide === CANNON`（房主选了小鬼方就会判错人）。
+- **对手离开后房间必须还能再进人。** `room.js` 收到 `bye` 或直连断开时会调
+  `_leavePairing()` 清掉 `_guestSid` / `transport`（**但不动 broker 连接和房间号**），
+  否则房主会一直回 `busy`，对手就再也进不来了。`_onPeerMessage()` 是两条传输路径
+  （DataChannel / MQTT 中继）的统一入口，加"需要同时影响房间状态"的消息时要从这里走。
 - 消息协议（JSON）：信令 `join` / `busy` / `offer` / `answer` / `transport`；
-  对局 `start`（携带棋盘）/ `move` / `restartRequest` / `bye`。
+  对局 `side`（房主换边）/ `start`（携带站位 + 棋盘）/ `move` / `restartRequest` / `bye`。
 - **全局只暴露命名空间，不暴露裸全局**：`js/mqtt.js` → `CannonMqtt`，
   `js/room.js` → `CannonRoom`（`CannonRoom.GameRoom` / `CannonRoom.normalizeRoomCode` …）。
   ⚠️ app.js 必须走命名空间。历史上这里漏过两次（裸 `P2PConnection`、裸 `normalizeRoomCode`），
   后果是内联 onclick 里的 async 报错被静默吞掉、点按钮毫无反应。E2E 覆盖这些路径。
 - 调试用 URL 参数：`?transport=relay` 强制走中继，`?brokers=` 换 broker。
+
+## 棋盘渲染要点（手机上"棋子对不上十字交点"就出在这里）
+
+棋盘有三种东西必须共用同一个坐标系：**canvas 上画的网格**、**按 px 绝对定位的格子**、
+**格子里的棋子**。任何让它们各自缩放的改动都会造成错位：
+
+- 棋盘是 `.board-wrapper`（flex 容器）的子项，所以 `.game-board` 有 `flex: none`。
+  ⚠️ 去掉它，可用宽度不够时棋盘会被 flex 压扁：canvas 是 `width:100%` 会跟着缩放，
+  格子是按 px 定位的不会，于是棋子越靠边越偏（电脑端够宽所以看不出来）。
+- 格子边长一律用 `fitCellSize()` 量**容器的真实可用空间**（`clientWidth` 减 padding），
+  ⚠️ 别再写 `window.innerWidth - 24` 这种魔数估算：它没算上 `.game-container` 与
+  `.board-wrapper` 的 padding，算出来的棋盘比可用宽度宽，就正好触发上面的压缩。
+- canvas 位图按 `devicePixelRatio` 放大、再用 `ctx.setTransform(dpr,0,0,dpr,0,0)`
+  把绘制坐标拉回 CSS 像素，网格在高分屏上才清晰。
+- `renderGameBoard()` / `renderEditorBoard()` 都走 `buildBoard()` + `placePieceInCell()`，
+  改棋盘只改这两个函数，别把逻辑抄回两份。
+
+`tests/browser/online.html` 里的 `measureAlignment()` 会**实测**每个格子中心与
+canvas 上对应交点的偏差（窄屏 380px 的 iframe 专门复现这个场景），
+`assertAligned()` 偏差超过 0.75px 或棋盘被压缩就报错。
+
+## 人机 AI 要点
+
+- 难度**只**由预判步数决定，写在 `js/ai.js` 顶部的 `AI_DEPTHS`（简单 1 / 普通 2 / 困难 4），
+  三档共用同一套 alpha-beta + `evaluateBoard`，改强度就改表里的数字。
+- 走法是**迭代加深**出来的：1 层 → 2 层 → … → 目标层，上一层的结论用来做走法排序，
+  alpha-beta 才剪得动。⚠️ 别退化成"直接按目标深度搜一次"，那样既慢又没法降级。
+- `AI_TIME_BUDGET_MS`（700ms）与 `AI_NODE_BUDGET` 是**手机不卡死**的保险：
+  超预算就退回上一层已经算完的结果，所以每手棋一定会返回一个合法走法。
+  改搜索宽度/评估函数后请跑 `tests/game.test.mjs` 里的耗时用例。
+- 模拟走子必须走 `applyMove()`：它复刻了 `GameState.movePiece` 的顺序
+  （先按走子方的回合判胜负，再换手）。顺序反了会把"被堵死"判到错的一方身上。
+- 当前实测：最大地图（8×8 / 24 鬼）困难模式约 7~100ms、几百个节点，远在预算内。
 
 ## 怎么验证
 
@@ -73,15 +114,18 @@ node --check js/app.js          # 语法检查（逐个文件）
 node --test tests/game.test.mjs # 单元用例
 node tests/browser/run.mjs      # 无头浏览器 E2E（自动找 Chrome/Edge，自带内置 MQTT broker）
 E2E_PUBLIC=1 node tests/browser/run.mjs   # 同上，但改走真实的公共 broker（验证真实链路）
+E2E_DSF=3 node tests/browser/run.mjs      # 同上，但模拟高分屏手机（验证棋盘 DPR 位图路径）
 ```
 
 `tests/browser/run.mjs` 会起临时静态服务 + 内置极简 MQTT broker，用无头浏览器跑
 `tests/browser/online.html`：多个同源 iframe 各加载一份真实 `index.html`，走完
-「建房 → 房间号进房 → 双方准备界面 → 房主选地图开局 → 双方走子同步 → 两条重开路径
-→ 第三人抢号被拒 → 强制中继模式再来一遍 → 本地/人机冒烟」，并收集 iframe 内被吞掉的
-async 报错，失败时还会把各页的 alert / 异常 / 状态一起打出来。
-**改动联机或界面流程后必须跑它**；它已经捕到过两个真实 bug（见上面的裸全局警告，
-以及内置 broker 的 CONNACK 忘了套 WebSocket 帧）。
+「建房 → 房间号进房 → 房主改执小鬼方（加入方自动变大炮方且由加入方先走）→ 双方准备界面
+→ 房主选地图开局 → 双方走子同步 → 两条重开路径 → 第三人抢号被拒 →
+对手离开后用同一房间号重进 → 强制中继模式再来一遍（含重进）→
+手机窄屏下棋子与网格交点的对齐 → 本地对局与三档人机各出一手」，
+并收集 iframe 内被吞掉的 async 报错，失败时还会把各页的 alert / 异常 / 状态一起打出来。
+**改动联机、棋盘渲染或界面流程后必须跑它**；它已经捕到过三个真实 bug（见上面的裸全局警告、
+内置 broker 的 CONNACK 忘了套 WebSocket 帧，以及棋盘被 flex 压缩导致手机上棋子错位）。
 
 浏览器 E2E 用 `node:test` 之外的方式跑，所以要单独一条命令（不在 `tests/` 目录里递归执行）。
 

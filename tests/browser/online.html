@@ -8,6 +8,8 @@
 <iframe id="fd" width="420" height="560" style="border:1px solid #999"></iframe>
 <iframe id="fe" width="420" height="560" style="border:1px solid #999"></iframe>
 <iframe id="ff" width="420" height="560" style="border:1px solid #999"></iframe>
+<!-- 手机宽度：用来复现/防回归"棋盘被压扁导致棋子对不上交点" -->
+<iframe id="fm" width="380" height="640" style="border:1px solid #999"></iframe>
 <script>
 // 先装错误上报，保证后面的脚本即使语法出错也能被看到。
 window.onerror = (msg, src, line) => {
@@ -107,6 +109,75 @@ async function loadFrame(frame, query) {
   await ready(frame);
 }
 
+/**
+ * 量"棋子有没有对准网格交点"。
+ *
+ * 网格是画在 canvas 上的，交点在画布坐标系的 (c*cs+cs/2, r*cs+cs/2)；
+ * 格子是按 px 绝对定位的 DOM。两者只有在"画布 CSS 尺寸 == 棋盘尺寸"时才重合 ——
+ * 一旦棋盘被 flex 压缩，画布会跟着缩放而格子不会，棋子就会越靠边越偏。
+ * 所以这里同时检查：棋盘没被压缩、画布与棋盘同尺寸、画布位图按 DPR 放大、以及
+ * 每个格子中心与它对应交点的实际偏差。
+ */
+function measureAlignment(win, doc, boardId, w, h) {
+  const board = doc.getElementById(boardId);
+  const canvas = board.querySelector('.board-canvas');
+  const boardRect = board.getBoundingClientRect();
+  const canvasRect = canvas.getBoundingClientRect();
+  const cs = win.eval('cellSize');
+  const dpr = win.devicePixelRatio || 1;
+  // 画布位图是 DPR 放大过的，换算回它的 CSS 像素坐标系才能算比例
+  const scaleX = canvasRect.width / (canvas.width / dpr);
+  const scaleY = canvasRect.height / (canvas.height / dpr);
+
+  let maxDeviation = 0;
+  let checked = 0;
+  for (const cell of board.querySelectorAll('.board-cell')) {
+    const r = Number(cell.dataset.r);
+    const c = Number(cell.dataset.c);
+    const rect = cell.getBoundingClientRect();
+    const expectedX = canvasRect.left + (c * cs + cs / 2) * scaleX;
+    const expectedY = canvasRect.top + (r * cs + cs / 2) * scaleY;
+    maxDeviation = Math.max(
+      maxDeviation,
+      Math.abs(rect.left + rect.width / 2 - expectedX),
+      Math.abs(rect.top + rect.height / 2 - expectedY)
+    );
+    checked++;
+  }
+
+  return {
+    checked,
+    expectedCount: w * h,
+    cellSize: cs,
+    dpr,
+    boardWidth: boardRect.width,
+    expectedBoardWidth: w * cs,
+    canvasWidth: canvasRect.width,
+    canvasBitmapWidth: canvas.width,
+    maxDeviation
+  };
+}
+
+function assertAligned(align, label) {
+  if (align.checked !== align.expectedCount) {
+    throw new Error(label + ' 格子数不对: ' + align.checked + ' / ' + align.expectedCount);
+  }
+  if (Math.abs(align.boardWidth - align.expectedBoardWidth) > 0.5) {
+    throw new Error(label + ' 棋盘被压缩了：实际 ' + align.boardWidth + 'px，应为 ' +
+      align.expectedBoardWidth + 'px（画布会跟着缩放、格子不会，于是棋子与网格错开）');
+  }
+  if (Math.abs(align.canvasWidth - align.boardWidth) > 0.5) {
+    throw new Error(label + ' 画布尺寸与棋盘不一致：画布 ' + align.canvasWidth + 'px，棋盘 ' + align.boardWidth + 'px');
+  }
+  if (Math.abs(align.canvasBitmapWidth - align.expectedBoardWidth * align.dpr) > 1) {
+    throw new Error(label + ' 画布位图没有按 DPR 放大：' + align.canvasBitmapWidth + 'px，应为 ' +
+      (align.expectedBoardWidth * align.dpr) + 'px（高分屏上网格会糊）');
+  }
+  if (align.maxDeviation > 0.75) {
+    throw new Error(label + ' 棋子与网格交点错位：最大偏差 ' + align.maxDeviation.toFixed(3) + 'px');
+  }
+}
+
 async function enterOnline(frame) {
   const doc = frame.contentDocument;
   doc.querySelector('#screen-menu .menu-btn[onclick="enterOnline()"]').click();
@@ -148,7 +219,8 @@ function pickMove(win, side) {
   })())`));
 }
 
-async function playRound(frameA, frameB, mode, label) {
+/** hostSide: 'cannon'（默认，房主执大炮）或 'ghost'（房主执小鬼，用来验证换边同步）。 */
+async function playRound(frameA, frameB, mode, label, hostSide = 'cannon') {
   const docA = frameA.contentDocument;
   const docB = frameB.contentDocument;
   const CA = frameA.contentWindow;
@@ -162,9 +234,28 @@ async function playRound(frameA, frameB, mode, label) {
   const code = await hostAndJoin(frameA, frameB);
   say('   房间号 ' + code + '，双方已进入准备界面');
 
+  if (hostSide === 'ghost') {
+    say(label + ' 2.5) 房主改执小鬼方，加入方应自动换成大炮方…');
+    docA.querySelector('#side-select .side-btn[data-side="ghost"]').click();
+    await until(() => G(CA, 'playerSide') === 2 && G(CB, 'playerSide') === 1, 10000, '加入方收到换边');
+    if (docA.getElementById('ready-role').textContent.indexOf('小鬼') === -1) {
+      throw new Error(label + ' 房主准备界面没显示小鬼方: ' + docA.getElementById('ready-role').textContent);
+    }
+    if (docB.getElementById('ready-role').textContent.indexOf('大炮') === -1) {
+      throw new Error(label + ' 加入方准备界面没跟着换成大炮方: ' + docB.getElementById('ready-role').textContent);
+    }
+    const selected = docA.querySelector('#side-select .side-btn.selected');
+    if (!selected || selected.dataset.side !== 'ghost') throw new Error(label + ' 房主选边的选中态不对');
+    say('   房主=小鬼方，加入方=大炮方（换边已同步）');
+  }
+
   say(label + ' 3) 校验角色、界面可见性、连接方式…');
-  if (G(CA, 'playerSide') !== 1) throw new Error(label + ' 房主应为大炮方，实为 ' + G(CA, 'playerSide'));
-  if (G(CB, 'playerSide') !== 2) throw new Error(label + ' 加入方应为小鬼方，实为 ' + G(CB, 'playerSide'));
+  if (G(CA, 'playerSide') !== (hostSide === 'ghost' ? 2 : 1)) {
+    throw new Error(label + ' 房主执子方不对，实为 ' + G(CA, 'playerSide'));
+  }
+  if (G(CB, 'playerSide') !== (hostSide === 'ghost' ? 1 : 2)) {
+    throw new Error(label + ' 加入方执子方不对，实为 ' + G(CB, 'playerSide'));
+  }
   if (G(CA, 'room.transport') !== mode) throw new Error(label + ' 房主连接方式应为 ' + mode);
   if (G(CB, 'room.transport') !== mode) throw new Error(label + ' 加入方连接方式应为 ' + mode);
 
@@ -177,7 +268,7 @@ async function playRound(frameA, frameB, mode, label) {
   if (docA.getElementById('ready-host-panel').style.display === 'none') throw new Error(label + ' 房主端未显示地图设置');
   if (docB.getElementById('ready-host-panel').style.display !== 'none') throw new Error(label + ' 加入方不该看到地图设置');
   if (docB.getElementById('ready-start-btn').style.display !== 'none') throw new Error(label + ' 加入方不该看到开始按钮');
-  say('   房主=大炮方可改地图，加入方=小鬼方只能等待，连接方式 ' + expectText);
+  say('   房主可改地图和站位，加入方只能等待，连接方式 ' + expectText);
 
   say(label + ' 4) 房主在准备界面选第 2 张地图并开局…');
   const presetBtns = docA.querySelectorAll('#preset-maps-online .preset-map-btn');
@@ -195,53 +286,110 @@ async function playRound(frameA, frameB, mode, label) {
   if (boardOf(CA) !== boardOf(CB)) throw new Error(label + ' 初始棋盘两端不一致');
   if (boardOf(CA) !== preset1) throw new Error(label + ' 开局棋盘不是房主选的那张地图');
   if (G(CA, 'gameMode') !== 'online' || G(CB, 'gameMode') !== 'online') throw new Error(label + ' gameMode 不是 online');
+  if (G(CA, 'playerSide') !== (hostSide === 'ghost' ? 2 : 1) || G(CB, 'playerSide') !== (hostSide === 'ghost' ? 1 : 2)) {
+    throw new Error(label + ' 开局后的执子方与准备界面不一致');
+  }
   say('   双方开局棋盘一致，且等于房主选的地图 (' + G(CA, 'gameState.width') + '×' + G(CA, 'gameState.height') +
     ' / 大炮 ' + G(CA, 'gameState.countCannons()') + ' / 小鬼 ' + G(CA, 'gameState.countGhosts()') + ')');
 
-  say(label + ' 5) 房主在真实棋盘上走一手…');
-  const cannonMove = pickMove(CA, 1);
-  if (!cannonMove) throw new Error(label + ' 找不到可走的大炮');
-  const beforeCannon = boardOf(CA);
-  cell(docA, cannonMove.fromR, cannonMove.fromC).click();
-  if (!G(CA, 'gameState.selectedPiece')) throw new Error(label + ' 点击己方大炮未选中');
-  cell(docA, cannonMove.toR, cannonMove.toC).click();
-  await until(() => G(CA, `gameState.getPiece(${cannonMove.toR},${cannonMove.toC})`) === 1 &&
-    G(CB, `gameState.getPiece(${cannonMove.toR},${cannonMove.toC})`) === 1 &&
-    boardOf(CA) === boardOf(CB) && turnOf(CA) === 2 && turnOf(CB) === 2,
-    20000, '房主走子同步到加入方');
-  if (boardOf(CA) === beforeCannon) throw new Error(label + ' 房主本地棋盘没有变化');
-  if (docB.getElementById('turn-text').textContent.indexOf('小鬼') === -1) {
-    throw new Error(label + ' 加入方回合提示未更新: ' + docB.getElementById('turn-text').textContent);
-  }
-  say('   加入方已重放该手，轮次交给小鬼方');
+  // 谁执大炮谁先走，跟房主选边无关，所以这里按 playerSide 找出双方，而不是写死房主。
+  const cannonWin = G(CA, 'playerSide') === 1 ? CA : CB;
+  const cannonDoc = cannonWin === CA ? docA : docB;
+  const ghostWin = cannonWin === CA ? CB : CA;
+  const ghostDoc = cannonWin === CA ? docB : docA;
+  const cannonWho = cannonWin === CA ? '房主' : '加入方';
 
-  say(label + ' 6) 加入方在真实棋盘上走一手小鬼…');
-  const ghostMove = pickMove(CB, 2);
-  if (!ghostMove) throw new Error(label + ' 找不到可走的小鬼');
-  cell(docB, ghostMove.fromR, ghostMove.fromC).click();
-  if (!G(CB, 'gameState.selectedPiece')) throw new Error(label + ' 加入方点击小鬼未选中');
-  cell(docB, ghostMove.toR, ghostMove.toC).click();
-  await until(() => G(CB, `gameState.getPiece(${ghostMove.toR},${ghostMove.toC})`) === 2 &&
-    G(CA, `gameState.getPiece(${ghostMove.toR},${ghostMove.toC})`) === 2 &&
-    boardOf(CA) === boardOf(CB) && turnOf(CA) === 1 && turnOf(CB) === 1,
-    20000, '加入方走子同步到房主');
-  if (docA.getElementById('turn-text').textContent.indexOf('大炮') === -1) {
-    throw new Error(label + ' 房主回合提示未更新: ' + docA.getElementById('turn-text').textContent);
+  say(label + ' 5) 大炮方（' + cannonWho + '）先走一手…');
+  const cannonMove = pickMove(cannonWin, 1);
+  if (!cannonMove) throw new Error(label + ' 找不到可走的大炮');
+  const beforeCannon = boardOf(cannonWin);
+  cell(cannonDoc, cannonMove.fromR, cannonMove.fromC).click();
+  if (!G(cannonWin, 'gameState.selectedPiece')) throw new Error(label + ' 点击己方大炮未选中');
+  cell(cannonDoc, cannonMove.toR, cannonMove.toC).click();
+  await until(() => G(cannonWin, `gameState.getPiece(${cannonMove.toR},${cannonMove.toC})`) === 1 &&
+    G(ghostWin, `gameState.getPiece(${cannonMove.toR},${cannonMove.toC})`) === 1 &&
+    boardOf(CA) === boardOf(CB) && turnOf(CA) === 2 && turnOf(CB) === 2,
+    20000, '大炮方走子同步到对手');
+  if (boardOf(cannonWin) === beforeCannon) throw new Error(label + ' 大炮方本地棋盘没有变化');
+  if (ghostDoc.getElementById('turn-text').textContent.indexOf('小鬼') === -1) {
+    throw new Error(label + ' 小鬼方回合提示未更新: ' + ghostDoc.getElementById('turn-text').textContent);
   }
-  say('   房主已重放该手，轮次交回大炮方');
+  say('   对手已重放该手，轮次交给小鬼方');
+
+  say(label + ' 6) 小鬼方在真实棋盘上走一手…');
+  const ghostMove = pickMove(ghostWin, 2);
+  if (!ghostMove) throw new Error(label + ' 找不到可走的小鬼');
+  cell(ghostDoc, ghostMove.fromR, ghostMove.fromC).click();
+  if (!G(ghostWin, 'gameState.selectedPiece')) throw new Error(label + ' 点击小鬼未选中');
+  cell(ghostDoc, ghostMove.toR, ghostMove.toC).click();
+  await until(() => G(ghostWin, `gameState.getPiece(${ghostMove.toR},${ghostMove.toC})`) === 2 &&
+    G(cannonWin, `gameState.getPiece(${ghostMove.toR},${ghostMove.toC})`) === 2 &&
+    boardOf(CA) === boardOf(CB) && turnOf(CA) === 1 && turnOf(CB) === 1,
+    20000, '小鬼方走子同步到对手');
+  if (cannonDoc.getElementById('turn-text').textContent.indexOf('大炮') === -1) {
+    throw new Error(label + ' 大炮方回合提示未更新: ' + cannonDoc.getElementById('turn-text').textContent);
+  }
+  say('   对手已重放该手，轮次交回大炮方');
 
   say(label + ' 7) 校验两端规则一致 + 非当前回合点不动对方棋子…');
   const capsExpr = 'gameState.getAllPiecesForSide(1).map(p => gameState.getCaptureMoves(p.r, p.c).length).join(",")';
   if (G(CA, capsExpr) !== G(CB, capsExpr)) throw new Error(label + ' 两端可用吃子数不一致');
 
-  const ghostPiece = JSON.parse(G(CA, 'JSON.stringify(gameState.getAllPiecesForSide(2)[0])'));
-  const beforeWrongTurn = boardOf(CB);
-  cell(docB, ghostPiece.r, ghostPiece.c).click();   // 轮到房主，加入方不该能选中自己的小鬼
-  if (G(CB, 'gameState.selectedPiece')) throw new Error(label + ' 非当前回合仍能选中棋子');
-  if (boardOf(CB) !== beforeWrongTurn) throw new Error(label + ' 非当前回合的点击改变了棋盘');
+  const ghostPiece = JSON.parse(G(ghostWin, 'JSON.stringify(gameState.getAllPiecesForSide(2)[0])'));
+  const beforeWrongTurn = boardOf(ghostWin);
+  cell(ghostDoc, ghostPiece.r, ghostPiece.c).click();   // 轮到大炮，小鬼方不该能选中自己的小鬼
+  if (G(ghostWin, 'gameState.selectedPiece')) throw new Error(label + ' 非当前回合仍能选中棋子');
+  if (boardOf(ghostWin) !== beforeWrongTurn) throw new Error(label + ' 非当前回合的点击改变了棋盘');
   say('   两端吃子数一致，非当前回合点击被正确忽略');
 
-  return { code, preset1 };
+  return { code, preset1, cannonWin, cannonDoc, ghostWin, ghostDoc };
+}
+
+/**
+ * 对手离开房间后，必须还能用同一个房间号回来。
+ * （曾经房主的 _guestSid/transport 一直留着，重进只会被回 busy，人就再也进不来了。）
+ */
+async function rejoinRound(frameA, frameB, code, label) {
+  const docA = frameA.contentDocument;
+  const docB = frameB.contentDocument;
+  const CA = frameA.contentWindow;
+  const CB = frameB.contentWindow;
+
+  say(label + ' 加入方点「返回」离开对局…');
+  G(CB, 'backToMenu()');
+  await until(() => isActive(docB, 'screen-menu') && G(CB, 'room') === null, 8000, '加入方回到主菜单');
+  // 这里就是 bug 的根：房主必须解除配对，否则后面那个 join 会被回 busy
+  await until(() => G(CA, 'room._guestSid') === null && G(CA, 'room.transport') === null,
+    10000, '房主解除与离开者的配对');
+  await until(() => docA.getElementById('game-status').textContent.indexOf('对手已离开') !== -1,
+    10000, '房主收到对手离开的提示');
+
+  say(label + ' 加入方用同一个房间号重进…');
+  G(CB, 'enterOnline()');
+  await until(() => isActive(docB, 'screen-online-lobby'), 5000, '加入方回到大厅');
+  docB.getElementById('room-code-input').value = code.toLowerCase();   // 顺便再验证一次归一化
+  docB.querySelector('#screen-online-lobby button[onclick="joinRoom()"]').click();
+
+  await until(() => isActive(docB, 'screen-online-ready') && isActive(docA, 'screen-online-ready'),
+    25000, '双方回到准备界面');
+  const alerts = G(CB, '__alerts');
+  if (alerts.length) throw new Error(label + ' 重进时弹了错误: ' + alerts.join(' / '));
+  if (G(CA, 'room.transport') === null) throw new Error(label + ' 重进后房主没有重新配对');
+  say('   双方已回到准备界面，房间号仍是 ' + code);
+
+  say(label + ' 房主重新开局，重进后的走子仍然同步…');
+  docA.getElementById('ready-start-btn').click();
+  await until(() => isActive(docA, 'screen-game') && isActive(docB, 'screen-game'), 20000, '重进后重新开局');
+  if (boardOf(CA) !== boardOf(CB)) throw new Error(label + ' 重进后开局棋盘不一致');
+
+  const cannonWin = G(CA, 'playerSide') === 1 ? CA : CB;
+  const cannonDoc = cannonWin === CA ? docA : docB;
+  const move = pickMove(cannonWin, 1);
+  if (!move) throw new Error(label + ' 重进后找不到可走的大炮');
+  cell(cannonDoc, move.fromR, move.fromC).click();
+  cell(cannonDoc, move.toR, move.toC).click();
+  await until(() => boardOf(CA) === boardOf(CB) && turnOf(CA) === 2, 20000, '重进后的走子同步');
+  say('   重进后的对局已恢复同步');
 }
 
 (async () => {
@@ -253,10 +401,10 @@ async function playRound(frameA, frameB, mode, label) {
     const E = document.getElementById('fe');
     const F = document.getElementById('ff');
 
-    // ---------- 直连模式 ----------
+    // ---------- 直连模式：房主改执小鬼，加入方自动成大炮方 ----------
     await loadFrame(A, BROKER_QUERY);
     await loadFrame(B, BROKER_QUERY);
-    const round1 = await playRound(A, B, 'p2p', '【直连】');
+    const round1 = await playRound(A, B, 'p2p', '【直连】', 'ghost');
 
     // ---------- 重开的两条路径 ----------
     const docA = A.contentDocument;
@@ -271,14 +419,14 @@ async function playRound(frameA, frameB, mode, label) {
       20000, '加入方请求重开同步');
     say('   双方已重置为房主选的初始局面（restartRequest → start 路径）');
 
-    say('【直连】 9) 房主先走一手，再点「再来一局」…');
-    const advance = pickMove(CA, 1);
-    cell(docA, advance.fromR, advance.fromC).click();
-    cell(docA, advance.toR, advance.toC).click();
+    say('【直连】 9) 大炮方先走一手，再点「再来一局」…');
+    const advance = pickMove(round1.cannonWin, 1);
+    cell(round1.cannonDoc, advance.fromR, advance.fromC).click();
+    cell(round1.cannonDoc, advance.toR, advance.toC).click();
     await until(() => boardOf(CA) === boardOf(CB) && turnOf(CA) === 2, 20000, '重开前先走一手');
     G(CA, 'restartGame()');
     await until(() => boardOf(CA) === boardOf(CB) && boardOf(CA) === initial && turnOf(CA) === 1, 20000, '房主直接重开同步');
-    say('   双方已重置（房主直发 start 路径）');
+    say('   双方已重置（房主直发 start 路径，房主执小鬼也能重开）');
 
     say('【直连】 10) 第三个页面抢同一房间号，应被拒绝且不影响房内对局…');
     await loadFrame(F, BROKER_QUERY);
@@ -294,11 +442,46 @@ async function playRound(frameA, frameB, mode, label) {
     if (boardOf(CA) !== boardOf(CB)) throw new Error('房内对局因此不同步');
     say('   第三人收到「已经有对手了」，房内对局不受影响');
 
+    // ---------- 对手离开后还能用同一个房间号回来（直连） ----------
+    say('【直连】 11) 加入方离开后，用同一个房间号重进…');
+    await rejoinRound(A, B, round1.code, '【直连重进】');
+
     // ---------- 强制中继模式 ----------
     const relayQuery = (BROKER_QUERY ? BROKER_QUERY + '&' : '') + 'transport=relay';
     await loadFrame(D, relayQuery);
     await loadFrame(E, relayQuery);
-    await playRound(D, E, 'relay', '【中继】');
+    const round2 = await playRound(D, E, 'relay', '【中继】');
+
+    // ---------- 中继模式下的重进（走的是 MQTT 信令，路径与直连不同） ----------
+    say('【中继】 12) 加入方离开后，用同一个房间号重进…');
+    await rejoinRound(D, E, round2.code, '【中继重进】');
+
+    // ---------- 手机窄屏：棋子必须对准网格交点 ----------
+    say('【手机窄屏】校验棋子与网格交点是否对齐…');
+    const M = document.getElementById('fm');
+    await loadFrame(M, BROKER_QUERY);
+    const docM = M.contentDocument;
+    const CM = M.contentWindow;
+
+    docM.querySelector('#screen-menu .menu-btn[onclick*="local-setup"]').click();
+    docM.querySelector('#screen-local-setup .start-btn').click();
+    await until(() => isActive(docM, 'screen-game') && G(CM, 'gameState'), 8000, '窄屏本地对局开局');
+
+    const gameAlign = measureAlignment(CM, docM, 'game-board', G(CM, 'gameState.width'), G(CM, 'gameState.height'));
+    assertAligned(gameAlign, '窄屏对局棋盘');
+    say('   对局棋盘 ' + gameAlign.boardWidth + 'px / 格子 ' + gameAlign.cellSize + 'px / DPR ' + gameAlign.dpr +
+      '，最大偏差 ' + gameAlign.maxDeviation.toFixed(3) + 'px');
+
+    G(CM, 'backToMenu()');
+    await until(() => isActive(docM, 'screen-menu'), 5000, '窄屏返回菜单');
+    docM.querySelector('#screen-menu .menu-btn[onclick*="local-setup"]').click();
+    docM.querySelector('#screen-local-setup button[onclick="showEditor(\'local\')"]').click();
+    await until(() => isActive(docM, 'screen-editor'), 5000, '窄屏进入地图编辑器');
+
+    const editorAlign = measureAlignment(CM, docM, 'editor-board', G(CM, 'editorState.width'), G(CM, 'editorState.height'));
+    assertAligned(editorAlign, '窄屏编辑器棋盘');
+    say('   编辑器棋盘 ' + editorAlign.boardWidth + 'px / 格子 ' + editorAlign.cellSize + 'px，最大偏差 ' +
+      editorAlign.maxDeviation.toFixed(3) + 'px');
 
     // ---------- 本地 / 人机冒烟 ----------
     say('【本地/人机】 11) 冒烟测试…');
@@ -315,9 +498,35 @@ async function playRound(frameA, frameB, mode, label) {
     say('   本地对局可开局、可走子');
 
     docF.querySelector('#screen-menu .menu-btn[onclick*="ai-setup"]').click();
-    docF.querySelector('#screen-ai-setup .start-btn').click();
-    await until(() => isActive(docF, 'screen-game') && G(CF, 'gameState.countCannons()') > 0, 8000, '人机对局开局');
-    say('   人机对局可开局（大炮 ' + G(CF, 'gameState.countCannons()') + ' 门 / 小鬼 ' + G(CF, 'gameState.countGhosts()') + ' 只）');
+    await until(() => isActive(docF, 'screen-ai-setup'), 5000, '进入人机设置界面');
+    say('   人机默认地图：大炮 ' + G(CF, 'PRESET_MAPS[selectedPreset.ai].cannons.length') +
+      ' 门 / 小鬼 ' + G(CF, 'PRESET_MAPS[selectedPreset.ai].ghosts.length') + ' 只');
+
+    // 三种难度都要真的在浏览器里出招：深度 1/2/4 的搜索不能报错、不能把界面卡住
+    for (const difficulty of ['easy', 'normal', 'hard']) {
+      docF.querySelector('#screen-menu .menu-btn[onclick*="ai-setup"]').click();
+      await until(() => isActive(docF, 'screen-ai-setup'), 5000, difficulty + ' 进入人机设置界面');
+      docF.getElementById('diff-' + difficulty).click();
+      if (G(CF, 'aiDifficulty') !== difficulty) throw new Error('难度没切到 ' + difficulty);
+      docF.querySelector('#screen-ai-setup .start-btn').click();
+      await until(() => isActive(docF, 'screen-game') && G(CF, 'gameState'), 8000, difficulty + ' 人机开局');
+
+      const mySide = G(CF, 'playerSide');
+      await until(() => G(CF, 'gameState.currentTurn') === mySide, 20000, difficulty + ' 轮到我走');
+      const myMove = pickMove(CF, mySide);
+      if (!myMove) throw new Error(difficulty + ' 找不到我方棋子');
+      cell(docF, myMove.fromR, myMove.fromC).click();
+      cell(docF, myMove.toR, myMove.toC).click();
+      const afterMine = boardOf(CF);
+
+      const startedAt = Date.now();
+      await until(() => G(CF, 'gameState.currentTurn') === mySide && boardOf(CF) !== afterMine,
+        20000, difficulty + ' 人机应当回走一手');
+      say('   ' + difficulty + ' 人机已回走（' + (Date.now() - startedAt) + 'ms，含 400ms 出招延时）');
+
+      G(CF, 'backToMenu()');
+      await until(() => isActive(docF, 'screen-menu'), 5000, difficulty + ' 返回菜单');
+    }
 
     say('12) 收集各页面里被吞掉的异常…');
     if (runtimeErrors.length) throw new Error('页面运行时报错: ' + runtimeErrors.join(' | '));

@@ -98,6 +98,8 @@ child = spawn(browser, [
   '--no-first-run',
   '--no-default-browser-check',
   '--disable-features=Translate',
+  // E2E_DSF=3 模拟高分屏手机，用来验证棋盘的 DPR 位图路径
+  ...(process.env.E2E_DSF ? ['--force-device-scale-factor=' + process.env.E2E_DSF] : []),
   '--user-data-dir=' + join(tmpdir(), 'cannon-goblin-e2e-' + Date.now()),
   url
 ], { stdio: 'ignore' });

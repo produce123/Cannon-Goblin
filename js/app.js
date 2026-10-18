@@ -94,61 +94,113 @@ function selectTool(tool) {
   document.getElementById('tool-' + tool).classList.add('active');
 }
 
-function renderEditorBoard() {
-  const board = document.getElementById('editor-board');
-  const w = editorState.width;
-  const h = editorState.height;
-  const maxW = Math.min(window.innerWidth - 40, 500);
-  const maxH = Math.min(window.innerHeight - 300, 500);
-  const cs = Math.floor(Math.min(maxW / w, maxH / h, 60));
+/**
+ * 按容器的真实可用空间算格子边长。
+ *
+ * ⚠️ 这里曾经用 window.innerWidth 减一个魔数来估算，在手机上会算大：
+ * 棋盘是 flex 子项（flex-shrink 默认为 1），可用宽度不够时棋盘会被压扁，
+ * 而画布是 width:100%（跟着一起缩放）、格子却是按 px 绝对定位的（不跟着动），
+ * 于是棋子相对网格整体偏移、越靠边越明显 —— 这就是"手机端棋子对不上十字交点"。
+ * 所以：宽度必须量容器的内容盒，且棋盘在 CSS 里设为 flex:none（不可压缩）。
+ */
+function fitCellSize(wrapper, w, h, maxCell) {
+  const style = getComputedStyle(wrapper);
+  const padX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+  const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  const availW = (wrapper.clientWidth || window.innerWidth) - padX;
+
+  // 高度不能量 wrapper：它是 flex:1，高度取决于棋盘自身，量它就成了循环计算。
+  // 改成"视口高度 - 棋盘以外的部分"。
+  let chrome = padY;
+  const container = wrapper.parentElement;
+  if (container) {
+    for (const child of container.children) {
+      if (child !== wrapper) chrome += child.getBoundingClientRect().height;
+    }
+    const containerStyle = getComputedStyle(container);
+    chrome += parseFloat(containerStyle.paddingTop) + parseFloat(containerStyle.paddingBottom);
+  }
+  const availH = window.innerHeight - chrome;
+
+  return Math.max(16, Math.min(Math.floor(availW / w), Math.floor(availH / h), maxCell));
+}
+
+/**
+ * 铺好一块棋盘：设尺寸、画网格、生成 w×h 个格子，返回 cells[r][c]。
+ * 位图按 DPR 放大再缩放回来，网格在高分屏上才清晰（之后都用 CSS 像素坐标画）。
+ */
+function buildBoard(board, w, h, cs) {
   cellSize = cs;
   document.documentElement.style.setProperty('--cell-size', cs + 'px');
-
   board.style.width = (w * cs) + 'px';
   board.style.height = (h * cs) + 'px';
   board.innerHTML = '';
 
+  const dpr = window.devicePixelRatio || 1;
   const canvas = document.createElement('canvas');
   canvas.className = 'board-canvas';
-  canvas.width = w * cs;
-  canvas.height = h * cs;
+  canvas.width = Math.round(w * cs * dpr);
+  canvas.height = Math.round(h * cs * dpr);
   board.appendChild(canvas);
-  drawGridLines(canvas, w, h, cs);
+
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawGridLines(ctx, w, h, cs);
+
+  const cells = [];
+  for (let r = 0; r < h; r++) {
+    const row = [];
+    for (let c = 0; c < w; c++) {
+      const cell = document.createElement('div');
+      cell.className = 'board-cell';
+      cell.dataset.r = r;
+      cell.dataset.c = c;
+      cell.style.width = cs + 'px';
+      cell.style.height = cs + 'px';
+      cell.style.left = (c * cs) + 'px';
+      cell.style.top = (r * cs) + 'px';
+      board.appendChild(cell);
+      row.push(cell);
+    }
+    cells.push(row);
+  }
+  return cells;
+}
+
+/** 往格子里放棋子（或空点）。返回放进去的棋子元素，空点返回 null。 */
+function placePieceInCell(cell, piece, cs) {
+  if (piece === EMPTY) {
+    const dot = document.createElement('div');
+    dot.className = 'cell-dot';
+    cell.appendChild(dot);
+    return null;
+  }
+  const element = document.createElement('div');
+  element.className = 'piece ' + (piece === CANNON ? 'cannon' : 'ghost');
+  element.textContent = piece === CANNON ? '💣' : '👻';
+  element.style.fontSize = Math.floor(cs * 0.45) + 'px';
+  cell.appendChild(element);
+  return element;
+}
+
+function renderEditorBoard() {
+  const board = document.getElementById('editor-board');
+  const w = editorState.width;
+  const h = editorState.height;
+  const cs = fitCellSize(board.parentElement, w, h, 60);
+  const cells = buildBoard(board, w, h, cs);
 
   let cannonCount = 0;
   let ghostCount = 0;
 
   for (let r = 0; r < h; r++) {
     for (let c = 0; c < w; c++) {
-      const cell = document.createElement('div');
-      cell.className = 'board-cell';
-      cell.style.width = cs + 'px';
-      cell.style.height = cs + 'px';
-      cell.style.left = (c * cs) + 'px';
-      cell.style.top = (r * cs) + 'px';
-
       const piece = editorState.getPiece(r, c);
-      if (piece === CANNON) {
-        cannonCount++;
-        const p = document.createElement('div');
-        p.className = 'piece cannon';
-        p.textContent = '💣';
-        p.style.fontSize = Math.floor(cs * 0.45) + 'px';
-        cell.appendChild(p);
-      } else if (piece === GHOST) {
-        ghostCount++;
-        const p = document.createElement('div');
-        p.className = 'piece ghost';
-        p.textContent = '👻';
-        p.style.fontSize = Math.floor(cs * 0.45) + 'px';
-        cell.appendChild(p);
-      } else {
-        const dot = document.createElement('div');
-        dot.className = 'cell-dot';
-        cell.appendChild(dot);
-      }
+      if (piece === CANNON) cannonCount++;
+      else if (piece === GHOST) ghostCount++;
+      placePieceInCell(cells[r][c], piece, cs);
 
-      cell.onclick = () => {
+      cells[r][c].onclick = () => {
         AudioManager.playClick();
         if (editorTool === 'cannon') {
           editorState.board[r][c] = editorState.board[r][c] === CANNON ? EMPTY : CANNON;
@@ -159,8 +211,6 @@ function renderEditorBoard() {
         }
         renderEditorBoard();
       };
-
-      board.appendChild(cell);
     }
   }
 
@@ -168,8 +218,7 @@ function renderEditorBoard() {
   document.getElementById('editor-ghost-count').textContent = ghostCount;
 }
 
-function drawGridLines(canvas, w, h, cs) {
-  const ctx = canvas.getContext('2d');
+function drawGridLines(ctx, w, h, cs) {
   ctx.strokeStyle = '#8b6914';
   ctx.lineWidth = 1;
 
@@ -265,57 +314,17 @@ function renderGameBoard() {
   const board = document.getElementById('game-board');
   const w = gameState.width;
   const h = gameState.height;
-
-  const maxW = Math.min(window.innerWidth - 24, 600);
-  const maxH = Math.min(window.innerHeight - 160, 600);
-  const cs = Math.floor(Math.min(maxW / w, maxH / h, 80));
-  cellSize = cs;
-  document.documentElement.style.setProperty('--cell-size', cs + 'px');
-
-  board.style.width = (w * cs) + 'px';
-  board.style.height = (h * cs) + 'px';
-  board.innerHTML = '';
-
-  const canvas = document.createElement('canvas');
-  canvas.className = 'board-canvas';
-  canvas.width = w * cs;
-  canvas.height = h * cs;
-  board.appendChild(canvas);
-  drawGridLines(canvas, w, h, cs);
+  const cs = fitCellSize(board.parentElement, w, h, 80);
+  const cells = buildBoard(board, w, h, cs);
 
   for (let r = 0; r < h; r++) {
     for (let c = 0; c < w; c++) {
-      const cell = document.createElement('div');
-      cell.className = 'board-cell';
-      cell.dataset.r = r;
-      cell.dataset.c = c;
-      cell.style.width = cs + 'px';
-      cell.style.height = cs + 'px';
-      cell.style.left = (c * cs) + 'px';
-      cell.style.top = (r * cs) + 'px';
+      const cell = cells[r][c];
+      const pieceElement = placePieceInCell(cell, gameState.getPiece(r, c), cs);
 
-      const piece = gameState.getPiece(r, c);
-      if (piece === CANNON) {
-        const p = document.createElement('div');
-        p.className = 'piece cannon';
-        p.textContent = '💣';
-        p.style.fontSize = Math.floor(cs * 0.45) + 'px';
-        cell.appendChild(p);
-      } else if (piece === GHOST) {
-        const p = document.createElement('div');
-        p.className = 'piece ghost';
-        p.textContent = '👻';
-        p.style.fontSize = Math.floor(cs * 0.45) + 'px';
-        cell.appendChild(p);
-      } else {
-        const dot = document.createElement('div');
-        dot.className = 'cell-dot';
-        cell.appendChild(dot);
-      }
-
-      if (gameState.selectedPiece && gameState.selectedPiece.r === r && gameState.selectedPiece.c === c) {
-        const p = cell.querySelector('.piece');
-        if (p) p.classList.add('selected');
+      if (pieceElement && gameState.selectedPiece &&
+          gameState.selectedPiece.r === r && gameState.selectedPiece.c === c) {
+        pieceElement.classList.add('selected');
       }
 
       const isValidMove = gameState.validMoves.find(m => m.r === r && m.c === c);
@@ -323,14 +332,11 @@ function renderGameBoard() {
         cell.classList.add(isValidMove.capture ? 'capture-highlight' : 'highlight');
       }
 
-      if (gameState.lastMove) {
-        if ((gameState.lastMove.toR === r && gameState.lastMove.toC === c)) {
-          cell.classList.add('last-move');
-        }
+      if (gameState.lastMove && gameState.lastMove.toR === r && gameState.lastMove.toC === c) {
+        cell.classList.add('last-move');
       }
 
       cell.onclick = () => handleCellClick(r, c);
-      board.appendChild(cell);
     }
   }
 }
@@ -498,7 +504,7 @@ function restartGame() {
     initGameFromPreset(PRESET_MAPS[selectedPreset.ai]);
   } else if (gameMode === 'online') {
     // 局面由房主持有，所以只有房主能直接开新局，加入方发请求。
-    if (playerSide === CANNON) {
+    if (isOnlineHost()) {
       startOnlineMatch();
     } else if (room && room.isReady()) {
       room.send('restartRequest', {});
@@ -532,6 +538,40 @@ function confirmQuit() {
 
 let room = null;
 let onlineInitial = null;       // 房主本局采用的初始局面 {width, height, board}
+let onlineHostSide = 'cannon';  // 房主执哪一方；加入方自动取另一方
+
+/** 房主才能决定局面和重开（局面在他手里）。 */
+function isOnlineHost() {
+  return !!room && room.role === 'host';
+}
+
+/** 房主换边：本地立刻生效，并同步给加入方。 */
+function chooseOnlineSide(side) {
+  AudioManager.playClick();
+  if (!isOnlineHost()) return;
+  applyOnlineSide(side);
+  room.send('side', { hostSide: onlineHostSide });
+}
+
+/** 统一算"我执哪一方"：房主听自己的选择，加入方永远取另一方。 */
+function applyOnlineSide(hostSide) {
+  onlineHostSide = hostSide === 'ghost' ? 'ghost' : 'cannon';
+  const mySide = isOnlineHost()
+    ? onlineHostSide
+    : (onlineHostSide === 'cannon' ? 'ghost' : 'cannon');
+  playerSide = mySide === 'cannon' ? CANNON : GHOST;
+  renderOnlineSide();
+}
+
+function renderOnlineSide() {
+  for (const button of document.querySelectorAll('#side-select .side-btn')) {
+    button.classList.toggle('selected', button.dataset.side === onlineHostSide);
+  }
+  const role = document.getElementById('ready-role');
+  if (role) {
+    role.textContent = playerSide === CANNON ? '💣 你是大炮方（先手）' : '👻 你是小鬼方（后手）';
+  }
+}
 
 function presetToInitial(preset) {
   const state = new GameState(preset.width, preset.height);
@@ -702,31 +742,35 @@ function enterOnline() {
   showScreen('online-lobby');
 }
 
-/* 连上之后双方都先到准备界面：房主选地图，加入方等待。 */
+/* 连上之后双方都先到准备界面：房主选自己执哪一方 + 选地图，加入方等待。 */
 function showReadyScreen(info) {
   const isHost = info.role === 'host';
-  playerSide = isHost ? CANNON : GHOST;
+  // 站位：房主听自己的选择，加入方用最近一次收到的（默认大炮方）。
+  // 不能在这里把加入方的站位重置成默认值 —— 房主的 side 消息可能已经到了，会被覆盖掉。
+  applyOnlineSide(onlineHostSide);
 
-  document.getElementById('ready-role').textContent =
-    playerSide === CANNON ? '💣 你是大炮方（先手）' : '👻 你是小鬼方';
   document.getElementById('ready-meta').textContent =
     '房间 ' + info.code + ' · ' + (info.transport === 'p2p' ? '直连模式' : '中转模式');
   document.getElementById('ready-host-panel').style.display = isHost ? '' : 'none';
   document.getElementById('ready-guest-panel').style.display = isHost ? 'none' : '';
   document.getElementById('ready-start-btn').style.display = isHost ? '' : 'none';
 
+  // 房主把当前站位同步一次，这样后进来的（或重进的）加入方一进来就是对的。
+  if (isHost) room.send('side', { hostSide: onlineHostSide });
+
   showScreen('online-ready');
 }
 
-/** 房主开始对局：把选定的局面下发给加入方，双方同时进棋盘。 */
+/** 房主开始对局：把选定的站位和局面一起下发给加入方，双方同时进棋盘。 */
 function startOnlineMatch() {
   AudioManager.playClick();
-  if (!room || !room.isReady()) {
+  if (!isOnlineHost()) return;
+  if (!room.isReady()) {
     alert('对手还没有进来');
     return;
   }
   onlineInitial = currentOnlineInitial();
-  room.send('start', onlineInitial);
+  room.send('start', { ...onlineInitial, hostSide: onlineHostSide });
   startOnlineGame(onlineInitial);
 }
 
@@ -742,6 +786,10 @@ function handlePeerMessage(message) {
   if (!message || typeof message !== 'object') return;
 
   switch (message.type) {
+    case 'side':
+      // 房主换边，加入方跟着换（自己的执子方永远是房主的对面）。
+      if (!isOnlineHost()) applyOnlineSide(message.hostSide);
+      break;
     case 'start':
       startOnlineGame(message);
       break;
@@ -749,11 +797,14 @@ function handlePeerMessage(message) {
       applyRemoteMove(message);
       break;
     case 'restartRequest':
-      // 重开由房主（大炮方）决定，并重新下发一次局面。
-      if (playerSide === CANNON) startOnlineMatch();
+      // 重开由房主决定（局面在他手里），并重新下发一次。
+      if (isOnlineHost()) startOnlineMatch();
       break;
     case 'bye':
-      setStatus('对手已离开对局');
+      // 对手离开：房间（房主这边）还开着，同一个房间号可以再进人。
+      setStatus(isOnlineHost()
+        ? '对手已离开，房间还开着：让他用同一个房间号再进就行'
+        : '房主已离开房间');
       break;
     default:
       break;
@@ -762,6 +813,8 @@ function handlePeerMessage(message) {
 
 function startOnlineGame(data) {
   if (!data || !Array.isArray(data.board) || !data.board.length) return;
+  // 开局时房主会把站位再带一次，加入方据此确定自己执哪一方。
+  if (data.hostSide) applyOnlineSide(data.hostSide);
 
   gameState = new GameState(data.width, data.height);
   gameState.board = data.board.map(row => [...row]);

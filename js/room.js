@@ -249,6 +249,7 @@
       this._outTopic = null;
       this._negotiating = false;
       this._joinTimer = null;
+      this._leavePeer = false;    // 标记"这次 peer 关闭是我们自己关的"，避免重复报掉线
       this.sid = null;            // 加入方的会话标识（房主用它定向回话）
       this._guestSid = null;      // 房主记住的当前对手
     }
@@ -398,9 +399,44 @@
 
         default:
           // 其余都是对局消息：直连模式下走 DataChannel，只有中继模式才从这里进。
-          if (this.transport === 'relay') this.handlers.onMessage?.(message);
+          if (this.transport === 'relay') this._onPeerMessage(message);
           break;
       }
+    }
+
+    /**
+     * 对手发来的对局消息。'bye' 要顺手解除配对：
+     * 否则房主的 _guestSid / transport 一直留着，同一个房间号再进人只会被回 busy ——
+     * 这就是"对手点返回离开后，再也进不来房间"的原因。解除配对不等于关房间，
+     * broker 连接不动，房间号继续有效。
+     */
+    _onPeerMessage(message) {
+      if (message && message.type === 'bye') this._leavePairing();
+      this.handlers.onMessage?.(message);
+    }
+
+    /** 对手走了（或直连断了）：回到"等人进来"的状态，房间继续开着。 */
+    _leavePairing() {
+      this._negotiating = false;
+      this.transport = null;
+      if (this._joinTimer) { clearTimeout(this._joinTimer); this._joinTimer = null; }
+
+      // 主动关闭要标记一下，别把自己的 close 当成"对手掉线"再报一次。
+      this._leavePeer = true;
+      try { this.peer?.close(); } catch { /* 已关闭 */ }
+      this.peer = null;
+
+      if (this.role === 'host') {
+        this._guestSid = null;
+        this.handlers.onStatus?.({ phase: 'waiting', code: this.code });
+      }
+    }
+
+    /** 直连断掉（对手关页面 / 掉线）时也要放出房间，不然房间就锁死了。 */
+    _onPeerClose() {
+      if (this.closed || this._leavePeer) return;
+      this._leavePairing();
+      this.handlers.onClosed?.('与对手的直连已断开');
     }
 
     async _startNegotiation() {
@@ -411,9 +447,10 @@
           return;
         }
 
+        this._leavePeer = false;
         this.peer = new P2PConnection({
-          onMessage: (message) => this.handlers.onMessage?.(message),
-          onClose: () => this.handlers.onClosed?.('与对手的直连已断开')
+          onMessage: (message) => this._onPeerMessage(message),
+          onClose: () => this._onPeerClose()
         });
 
         const offer = await this.peer.createOffer();
@@ -438,9 +475,10 @@
     async _acceptOffer(message) {
       if (this.forcedTransport === 'relay' || typeof RTCPeerConnection === 'undefined') return;
       try {
+        this._leavePeer = false;
         this.peer = new P2PConnection({
-          onMessage: (msg) => this.handlers.onMessage?.(msg),
-          onClose: () => this.handlers.onClosed?.('与对手的直连已断开')
+          onMessage: (msg) => this._onPeerMessage(msg),
+          onClose: () => this._onPeerClose()
         });
         const answer = await this.peer.acceptOffer({ type: 'offer', sdp: message.sdp });
         this._publish({ type: 'answer', sdp: answer.sdp });

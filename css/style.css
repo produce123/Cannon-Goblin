@@ -545,6 +545,42 @@ body {
   color: var(--text-secondary);
 }
 
+/* 房主选自己执哪一方 */
+.side-select {
+  display: flex;
+  gap: 10px;
+}
+
+.side-btn {
+  flex: 1;
+  padding: 12px 8px;
+  background: var(--bg-secondary);
+  border: 2px solid transparent;
+  border-radius: 10px;
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.side-btn small {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+
+.side-btn:hover {
+  border-color: var(--accent);
+}
+
+.side-btn.selected {
+  border-color: var(--accent);
+  background: rgba(233, 69, 96, 0.15);
+}
+
 .waiting-spinner {
   width: 34px;
   height: 34px;
@@ -647,6 +683,10 @@ body {
   background: var(--board-bg);
   border-radius: 8px;
   box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+  /* 棋盘是 flex 子项，绝不能让它被压缩：
+     否则画布（width:100%）会跟着缩放，而按 px 绝对定位的格子不会，
+     棋子就会相对网格整体偏移（手机上"棋子对不上十字交点"就是这个原因）。 */
+  flex: none;
 }
 
 .board-canvas {

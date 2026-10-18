@@ -10,21 +10,21 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 function loadSandbox() {
   const sandbox = {
-    console, TextEncoder, TextDecoder, setTimeout, clearTimeout,
+    console, TextEncoder, TextDecoder, setTimeout, clearTimeout, setInterval, clearInterval,
     URLSearchParams, crypto: globalThis.crypto
   };
   vm.createContext(sandbox);
-  for (const file of ['js/game.js', 'js/mqtt.js', 'js/room.js']) {
+  for (const file of ['js/game.js', 'js/ai.js', 'js/mqtt.js', 'js/room.js']) {
     vm.runInContext(readFileSync(join(ROOT, file), 'utf8'), sandbox, { filename: file });
   }
   vm.runInContext(
-    'globalThis.__api = { GameState, EMPTY, CANNON, GHOST, CannonMqtt, CannonRoom };',
+    'globalThis.__api = { GameState, EMPTY, CANNON, GHOST, PRESET_MAPS, AIPlayer, CannonMqtt, CannonRoom };',
     sandbox
   );
   return sandbox.__api;
 }
 
-const { GameState, CANNON, GHOST, CannonMqtt, CannonRoom } = loadSandbox();
+const { GameState, EMPTY, CANNON, GHOST, PRESET_MAPS, AIPlayer, CannonMqtt, CannonRoom } = loadSandbox();
 
 // 沙箱里的对象来自另一个 realm，原型不同会让严格深比较失败，先转成本 realm 的普通对象。
 const plain = (value) => JSON.parse(JSON.stringify(value));
@@ -290,4 +290,93 @@ test('吃子同样能在双方本地重放出一致局面', () => {
   assert.deepEqual(host.board, guest.board);
   assert.equal(host.currentTurn, GHOST);
   assert.equal(guest.currentTurn, GHOST);
+});
+
+// ---------- 人机 AI：难度就是"预测几步" ----------
+
+function fromPreset(index, turn = CANNON) {
+  const preset = PRESET_MAPS[index];
+  const gs = new GameState(preset.width, preset.height);
+  for (const [r, c] of preset.cannons) gs.placeCannon(r, c);
+  for (const [r, c] of preset.ghosts) gs.placeGhost(r, c);
+  gs.currentTurn = turn;
+  return gs;
+}
+
+function isLegalMove(gs, move) {
+  if (!move) return false;
+  return gs.getAllMoves(move.from.r, move.from.c)
+    .some(m => m.r === move.to.r && m.c === move.to.c);
+}
+
+test('三种难度在预设地图上都返回合法走法（双方都测）', () => {
+  for (let index = 0; index < PRESET_MAPS.length; index++) {
+    for (const side of [CANNON, GHOST]) {
+      for (const difficulty of ['easy', 'normal', 'hard']) {
+        const move = AIPlayer.makeMove(fromPreset(index, side), side, difficulty);
+        assert.ok(move, `${PRESET_MAPS[index].name} ${difficulty} 应当有走法`);
+        assert.ok(isLegalMove(fromPreset(index, side), move),
+          `${PRESET_MAPS[index].name} ${difficulty} 的走法必须合法`);
+      }
+    }
+  }
+});
+
+test('难度对应预测步数：1 步 / 2 步 / 4 步（用搜索节点数验证）', () => {
+  const gs = fromPreset(1, CANNON);
+
+  const nodes = {};
+  for (const difficulty of ['easy', 'normal', 'hard']) {
+    const move = AIPlayer.makeMove(gs, CANNON, difficulty);
+    assert.ok(move, `${difficulty} 应当给出走法`);
+    nodes[difficulty] = AIPlayer.nodes;
+  }
+
+  // 1 步 = 根节点自己比一遍，不递归；2 步和 4 步会递归下去，节点数必须递增
+  assert.equal(nodes.easy, 0, '简单模式只预测 1 步：不应有任何递归搜索');
+  assert.ok(nodes.normal > nodes.easy, `普通模式(2步)应比简单模式搜得多: ${nodes.normal} > ${nodes.easy}`);
+  assert.ok(nodes.hard > nodes.normal, `困难模式(4步)应比普通模式搜得多: ${nodes.hard} > ${nodes.normal}`);
+
+  // 深度参数直接决定搜索规模：同一个局面，4 层的节点数必须明显多于 1 层
+  const shallow = AIPlayer.searchMove(gs, CANNON, 1) && AIPlayer.nodes;
+  const deep = AIPlayer.searchMove(gs, CANNON, 4) && AIPlayer.nodes;
+  assert.ok(deep > shallow * 10, `4 层应比 1 层搜得深得多: ${deep} vs ${shallow}`);
+});
+
+test('简单的 1 步预测也能立刻吃到眼前的小鬼', () => {
+  const build = () => {
+    const gs = new GameState(6, 6);
+    gs.placeCannon(2, 2);
+    gs.placeGhost(2, 4); // (2,3) 为空，大炮可以隔空吃掉它
+    for (const [r, c] of [[5, 0], [5, 1], [5, 2], [5, 3], [5, 4]]) gs.placeGhost(r, c);
+    return gs;
+  };
+
+  for (const difficulty of ['easy', 'normal', 'hard']) {
+    const gs = build();
+    const move = AIPlayer.makeMove(gs, CANNON, difficulty);
+    assert.equal(move.to.capture, true, `${difficulty} 应当选择吃子`);
+    assert.deepEqual(plain(move.to), { r: 2, c: 4, capture: true });
+  }
+});
+
+test('无子可走时返回 null，不会瞎走', () => {
+  const gs = new GameState(6, 6);
+  gs.placeCannon(0, 0);
+  gs.placeGhost(0, 1); // 右边被堵
+  gs.placeGhost(1, 0); // 下边被堵
+  for (const [r, c] of [[5, 5], [5, 4], [4, 5]]) gs.placeGhost(r, c);
+
+  assert.equal(AIPlayer.makeMove(gs, CANNON, 'hard'), null);
+});
+
+test('困难模式思考时间受预算保护（不能把界面卡住）', () => {
+  for (const turn of [CANNON, GHOST]) {
+    const gs = fromPreset(1, turn);
+    const started = Date.now();
+    assert.ok(AIPlayer.makeMove(gs, turn, 'hard'), '应当给出走法');
+    const elapsed = Date.now() - started;
+    // 时间预算 700ms，留足余量：这里主要防止有人把预算/剪枝改坏导致手机端卡死
+    assert.ok(elapsed < 3000, `困难模式在最大地图上耗时 ${elapsed}ms，超出预期`);
+  }
 });

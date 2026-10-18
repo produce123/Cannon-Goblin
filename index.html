@@ -101,17 +101,17 @@
             <button class="difficulty-btn" id="diff-easy" onclick="selectDifficulty('easy')">
               <span class="diff-icon">🌱</span>
               <span>简单</span>
-              <span class="diff-desc">随机移动</span>
+              <span class="diff-desc">预判 1 步</span>
             </button>
             <button class="difficulty-btn selected" id="diff-normal" onclick="selectDifficulty('normal')">
               <span class="diff-icon">⚔️</span>
               <span>普通</span>
-              <span class="diff-desc">策略移动</span>
+              <span class="diff-desc">预判 2 步</span>
             </button>
             <button class="difficulty-btn" id="diff-hard" onclick="selectDifficulty('hard')">
               <span class="diff-icon">💀</span>
               <span>困难</span>
-              <span class="diff-desc">深度计算</span>
+              <span class="diff-desc">预判 4 步</span>
             </button>
           </div>
         </div>
@@ -221,6 +221,17 @@
         </div>
 
         <div id="ready-host-panel">
+          <div class="setup-section">
+            <h3>你执哪一方</h3>
+            <div class="side-select" id="side-select">
+              <button class="side-btn selected" data-side="cannon" onclick="chooseOnlineSide('cannon')">
+                💣 大炮方 <small>先手 · 远程吃子</small>
+              </button>
+              <button class="side-btn" data-side="ghost" onclick="chooseOnlineSide('ghost')">
+                👻 小鬼方 <small>后手 · 数量围堵</small>
+              </button>
+            </div>
+          </div>
           <div class="setup-section">
             <h3>选择预设地图</h3>
             <div class="preset-maps" id="preset-maps-online"></div>

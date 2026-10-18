@@ -9,65 +9,198 @@ import vm from 'node:vm';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 function loadSandbox() {
-  const sandbox = { console, TextEncoder, TextDecoder, btoa, atob, setTimeout, clearTimeout };
+  const sandbox = {
+    console, TextEncoder, TextDecoder, setTimeout, clearTimeout,
+    URLSearchParams, crypto: globalThis.crypto
+  };
   vm.createContext(sandbox);
-  for (const file of ['js/game.js', 'js/webrtc.js']) {
+  for (const file of ['js/game.js', 'js/mqtt.js', 'js/room.js']) {
     vm.runInContext(readFileSync(join(ROOT, file), 'utf8'), sandbox, { filename: file });
   }
   vm.runInContext(
-    'globalThis.__api = { GameState, EMPTY, CANNON, GHOST, CannonSignaling, CannonWebRTC };',
+    'globalThis.__api = { GameState, EMPTY, CANNON, GHOST, CannonMqtt, CannonRoom };',
     sandbox
   );
   return sandbox.__api;
 }
 
-const { GameState, CANNON, GHOST, CannonSignaling, CannonWebRTC } = loadSandbox();
+const { GameState, CANNON, GHOST, CannonMqtt, CannonRoom } = loadSandbox();
 
 // 沙箱里的对象来自另一个 realm，原型不同会让严格深比较失败，先转成本 realm 的普通对象。
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
-// ---------- 信令编解码 ----------
+// ---------- MQTT 报文编解码（联机中转的基础） ----------
 
-test('邀请码/应答码可无损往返，且只包含可粘贴字符', () => {
+test('CONNECT 报文编码正确（协议名 / 级别 / clean session / keepalive / clientId）', () => {
+  const packet = CannonMqtt.buildConnect('cg-test', 45);
+
+  assert.equal(packet[0], 0x10, 'CONNECT 固定头');
+  assert.deepEqual(Array.from(packet.slice(2, 8)), [0x00, 0x04, 0x4d, 0x51, 0x54, 0x54], '协议名应为 MQTT');
+  assert.equal(packet[8], 4, '协议级别应为 3.1.1');
+  assert.equal(packet[9], 0x02, '应为 clean session');
+  assert.equal((packet[10] << 8) | packet[11], 45, 'keepalive 应写入');
+  assert.equal((packet[12] << 8) | packet[13], 7, 'clientId 长度前缀');
+  assert.equal(Buffer.from(packet.slice(14)).toString('utf8'), 'cg-test');
+});
+
+test('SUBSCRIBE 报文指向目标话题（QoS 0）', () => {
+  const packet = CannonMqtt.buildSubscribe(7, 'cannongoblin/v1/ABC234/h2g');
+  assert.equal(packet[0], 0x82);
+  assert.equal((packet[2] << 8) | packet[3], 7, 'packetId 应写入');
+
+  const topicLength = (packet[4] << 8) | packet[5];
+  assert.equal(Buffer.from(packet.slice(6, 6 + topicLength)).toString('utf8'), 'cannongoblin/v1/ABC234/h2g');
+  assert.equal(packet[6 + topicLength], 0x00, '请求 QoS 0');
+});
+
+test('PUBLISH 报文（长度字段跨字节）能被同协议的解析器无损还原', () => {
+  const topic = 'cannongoblin/v1/ABC234/h2g';
+  // 真实 SDP 有 1~2KB，长度字段必须是多字节的变长整数
   const sdp = 'v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n' +
-    'a=ice-ufrag:Ab3/xY\r\na=fingerprint:sha-256 AB:CD:EF\r\n';
+    'a=fingerprint:sha-256 ' + 'AB:CD:EF:01:23:45:67:89'.repeat(6) + '\r\n' +
+    ('a=candidate:1 1 udp 2113937151 192.168.1.5 54321 typ host\r\n').repeat(4);
+  const payload = JSON.stringify({ type: 'offer', sdp });
+  const packet = CannonMqtt.buildPublish(topic, payload);
 
-  for (const type of ['offer', 'answer']) {
-    const code = CannonSignaling.encodeDescription({ type, sdp });
-    assert.ok(code.startsWith(CannonWebRTC.CODE_PREFIX), '邀请码应带协议前缀');
-    assert.match(code, /^CG1\.[A-Za-z0-9+/=]+$/, '邀请码应只含 base64 字符，便于聊天工具转发');
-    assert.deepEqual(plain(CannonSignaling.decodeDescription(code)), { type, sdp });
+  assert.equal(packet[0], 0x30, 'PUBLISH 固定头');
+  assert.ok(packet.length > 127, '这条报文应当需要多字节长度字段');
+  assert.ok((packet[1] & 0x80) !== 0, '长度字段第一个字节应带续位标志');
+
+  const { packets, rest } = CannonMqtt.decodePackets(packet);
+  assert.equal(rest.length, 0, '不应有剩余字节');
+  assert.equal(packets.length, 1);
+  assert.equal(packets[0].type, 3);
+
+  const parsed = CannonMqtt.parsePublish(packets[0].body);
+  assert.equal(parsed.topic, topic);
+  assert.equal(parsed.payload, payload);
+});
+
+test('decodePackets 能把跨分片的字节流拼回完整报文', () => {
+  const ping = CannonMqtt.buildPingReq();
+  const publish = CannonMqtt.buildPublish('topic/x', 'hello');
+  const stream = new Uint8Array([...ping, ...publish]);
+
+  // 只喂前 3 字节：PINGREQ 完整，PUBLISH 只到了固定头
+  const first = CannonMqtt.decodePackets(stream.slice(0, 3));
+  assert.equal(first.packets.length, 1);
+  assert.equal(first.packets[0].type, 12, 'PINGREQ');
+  assert.equal(first.rest.length, 1, '剩下的半个报文必须留着');
+
+  const second = CannonMqtt.decodePackets(new Uint8Array([...first.rest, ...stream.slice(3)]));
+  assert.equal(second.packets.length, 1);
+  assert.equal(second.packets[0].type, 3);
+  assert.equal(second.rest.length, 0);
+  assert.deepEqual(plain(CannonMqtt.parsePublish(second.packets[0].body)), { topic: 'topic/x', payload: 'hello' });
+});
+
+test('长度字段没读全时不吐出半个报文', () => {
+  const packet = CannonMqtt.buildPublish('t', 'x'.repeat(200));
+  const partial = packet.slice(0, 2);   // 固定头 + 一个带续位标志的长度字节
+
+  const decoded = CannonMqtt.decodePackets(partial);
+  assert.equal(decoded.packets.length, 0);
+  assert.equal(decoded.rest.length, partial.length, '未消费的字节必须原样保留');
+});
+
+// ---------- 房间号 ----------
+
+test('房间号是 6 位，且不含 0/O/1/I/L 这类易混字符', () => {
+  for (let i = 0; i < 300; i++) {
+    const code = CannonRoom.generateRoomCode();
+    assert.equal(code.length, 6);
+    assert.match(code, /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$/);
+    assert.doesNotMatch(code, /[0O1IL]/);
   }
 });
 
-test('解析容忍聊天工具插入的换行、空格与零宽字符', () => {
-  const expected = { type: 'offer', sdp: 'v=0\r\na=mid:0\r\n' };
-  const code = CannonSignaling.encodeDescription(expected);
-
-  const chunks = code.slice(4).replace(/(.{40})/g, '$1\n\u200b');
-  const mangled = '  ' + chunks + '\n\n';
-  assert.deepEqual(plain(CannonSignaling.decodeDescription(mangled)), expected);
-
-  // 前缀被聊天工具吃掉时也应能解析
-  assert.deepEqual(plain(CannonSignaling.decodeDescription(code.replace('CG1.', ''))), expected);
+test('房间号输入归一化：转大写、剔除字母表外字符、最多 6 位', () => {
+  assert.equal(CannonRoom.normalizeRoomCode('abc234'), 'ABC234');
+  assert.equal(CannonRoom.normalizeRoomCode(' a b c 2 3 4 '), 'ABC234');
+  assert.equal(CannonRoom.normalizeRoomCode('ab-12il'), 'AB2', '1/i/l 不属于字母表');
+  assert.equal(CannonRoom.normalizeRoomCode('ABCDEFGHJKM'), 'ABCDEF', '超出 6 位要截断');
+  assert.equal(CannonRoom.normalizeRoomCode('0O1IL'), '');
+  assert.equal(CannonRoom.normalizeRoomCode(null), '');
+  assert.equal(CannonRoom.normalizeRoomCode(undefined), '');
 });
 
-test('可直接粘贴 JSON 原文（便于调试）', () => {
-  const expected = { type: 'answer', sdp: 'v=0\r\n' };
-  const raw = JSON.stringify({ v: 1, type: expected.type, sdp: expected.sdp });
-  assert.deepEqual(plain(CannonSignaling.decodeDescription(raw)), expected);
+// ---------- 房间话题与定向投递 ----------
+
+test('房主与加入方的话题方向相反且严丝合缝（自己不会收到自己发的消息）', () => {
+  const host = new CannonRoom.GameRoom();
+  host.role = 'host';
+  host.code = 'ABC234';
+  host._setTopics();
+
+  const guest = new CannonRoom.GameRoom();
+  guest.role = 'guest';
+  guest.code = 'ABC234';
+  guest._setTopics();
+
+  assert.ok(host._inTopic.endsWith('/g2h'));
+  assert.ok(host._outTopic.endsWith('/h2g'));
+  assert.notEqual(host._inTopic, host._outTopic, '同一个人不能既订阅又发布同一话题');
+  assert.equal(guest._inTopic, host._outTopic, '一方发布的必须是另一方订阅的');
+  assert.equal(guest._outTopic, host._inTopic);
+  assert.ok(host._inTopic.startsWith(CannonRoom.TOPIC_ROOT + '/ABC234/'));
 });
 
-test('拒绝空码、乱码、被截断的码与错误类型', () => {
-  assert.throws(() => CannonSignaling.decodeDescription(''), /代码为空/);
-  assert.throws(() => CannonSignaling.decodeDescription('   '), /代码为空/);
-  assert.throws(() => CannonSignaling.decodeDescription('这不是邀请码'));
+/** 构造一个不真的连 broker 的房间，只测消息编址。 */
+function fakeRoom(role, code, sid) {
+  const room = new CannonRoom.GameRoom();
+  room.role = role;
+  room.code = code;
+  room.sid = sid || null;
+  room._setTopics();
+  room.transport = 'relay';
+  room.published = [];
+  room.mqtt = {
+    publish: (topic, payload) => { room.published.push({ topic, payload }); return true; }
+  };
+  room.received = [];
+  room.handlers = { onMessage: (message) => room.received.push(message) };
+  return room;
+}
 
-  const code = CannonSignaling.encodeDescription({ type: 'offer', sdp: 'v=0\r\n' });
-  assert.throws(() => CannonSignaling.decodeDescription(code.slice(0, code.length - 8)));
+test('中继模式下房主发出的消息带对手 sid；busy 的 sid 不会被覆盖', () => {
+  const host = fakeRoom('host', 'ABC234');
+  host._guestSid = 'deadbeef';
 
-  const wrongType = 'CG1.' + Buffer.from(JSON.stringify({ v: 1, type: 'candidate', sdp: 'x' })).toString('base64');
-  assert.throws(() => CannonSignaling.decodeDescription(wrongType), /类型不正确/);
+  host.send('move', { fromR: 1, fromC: 1, toR: 2, toC: 1 });
+  assert.equal(host.published.length, 1);
+  assert.equal(host.published[0].topic, host._outTopic);
+  assert.deepEqual(plain(JSON.parse(host.published[0].payload)),
+    { type: 'move', fromR: 1, fromC: 1, toR: 2, toC: 1, sid: 'deadbeef' });
+
+  // 多出来的加入方触发的 busy 是发给"他"的，不能把 sid 改成房里对手的
+  host._publish({ type: 'busy', sid: 'othersid' });
+  assert.equal(JSON.parse(host.published[1].payload).sid, 'othersid');
+});
+
+test('加入方丢弃 sid 对不上的消息，只接收发给自己的（防止公共话题上误收别人的信令）', () => {
+  const guest = fakeRoom('guest', 'ABC234', 'mine');
+
+  guest._onWire(JSON.stringify({ type: 'move', sid: 'someone-else', toR: 9, toC: 9 }));
+  guest._onWire(JSON.stringify({ type: 'transport', mode: 'relay', sid: 'someone-else' }));
+  guest._onWire(JSON.stringify({ type: 'move', sid: 'mine', toR: 2, toC: 2 }));
+
+  assert.equal(guest.received.length, 1, '只有 sid 匹配的对局消息能进来');
+  assert.equal(guest.received[0].toR, 2);
+  assert.equal(guest.transport, 'relay', '别人的 transport 决定不能生效');
+});
+
+test('房主对第二个加入方回 busy，对同一个加入方的重试保持沉默', () => {
+  const host = fakeRoom('host', 'ABC234');
+  host._guestSid = 'first';
+  host.transport = 'p2p';
+
+  host._onWire(JSON.stringify({ type: 'join', sid: 'first' }));     // 同一个人的重试
+  assert.equal(host.published.length, 0, '重试应被静默忽略');
+
+  host._onWire(JSON.stringify({ type: 'join', sid: 'second' }));    // 后来者
+  assert.equal(host.published.length, 1);
+  assert.deepEqual(plain(JSON.parse(host.published[0].payload)), { type: 'busy', sid: 'second' });
+  assert.equal(host._guestSid, 'first', '房里原有的对手不能被顶掉');
 });
 
 // ---------- 对局规则（双方本地重放的一致性前提） ----------

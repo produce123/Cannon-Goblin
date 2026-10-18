@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>PENDING</title></head>
+<body style="margin:0">
+<pre id="out" style="font:12px monospace">running…</pre>
+<iframe id="fa" width="420" height="560" style="border:1px solid #999"></iframe>
+<iframe id="fb" width="420" height="560" style="border:1px solid #999"></iframe>
+<iframe id="fd" width="420" height="560" style="border:1px solid #999"></iframe>
+<iframe id="fe" width="420" height="560" style="border:1px solid #999"></iframe>
+<iframe id="ff" width="420" height="560" style="border:1px solid #999"></iframe>
+<script>
+// 先装错误上报，保证后面的脚本即使语法出错也能被看到。
+window.onerror = (msg, src, line) => {
+  fetch('/progress', { method: 'POST', body: 'HARNESS ERROR: ' + msg + ' @' + line }).catch(() => {});
+};
+window.onunhandledrejection = (e) => {
+  fetch('/progress', { method: 'POST', body: 'HARNESS REJECTION: ' + ((e.reason && e.reason.stack) || e.reason) }).catch(() => {});
+};
+</script>
+<script>
+/*
+ * 用同源 iframe 各加载一份真实 index.html，跑完整的联机流程：
+ *   在线大厅 → 房主建房(6 位房间号) → 加入方输房间号(故意小写) → 双方准备界面
+ *   → 房主选地图开局 → 双方走子同步 → 非当前回合防护 → 两条重开路径
+ *   → 第三人抢同一房间号被拒（且不影响房内对局）
+ *   → 再跑一遍强制中继模式(?transport=relay) → 本地/人机冒烟
+ *
+ * iframe 里的 MQTT 指向 run.mjs 自带的本地 broker，所以 E2E 不依赖公网。
+ * 注意：app.js 里 gameState / playerSide / room 等是 let/const 全局词法绑定，不是 window 属性，
+ * 所以跨文档读取必须走 iframe 自己的 eval。
+ */
+const log = [];
+const out = document.getElementById('out');
+const say = (m) => {
+  log.push(m);
+  out.textContent = log.join('\n');
+  fetch('/progress', { method: 'POST', body: m }).catch(() => {});
+};
+const wait = (ms) => new Promise(r => setTimeout(r, ms));
+
+const G = (win, expr) => win.eval(expr);
+const boardOf = (win) => JSON.stringify(G(win, 'gameState.board'));
+const turnOf = (win) => G(win, 'gameState.currentTurn');
+const cell = (doc, r, c) => doc.querySelector(`#game-board .board-cell[data-r="${r}"][data-c="${c}"]`);
+const isActive = (doc, id) => doc.getElementById(id).classList.contains('active');
+
+// run.mjs 起的内置 broker 就在同一个临时服务器上。
+// 加 ?public=1 则不注入 broker，改走 app 里内置的公共 broker 列表（用来验证真实链路）。
+const BROKER = 'ws://' + location.host + '/mqtt';
+const USE_PUBLIC_BROKERS = new URLSearchParams(location.search).has('public');
+const BROKER_QUERY = USE_PUBLIC_BROKERS ? '' : 'brokers=' + encodeURIComponent(BROKER);
+const CODE_RE = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$/;
+
+function report(ok, detail) {
+  document.title = ok ? 'E2E-PASS' : 'E2E-FAIL';
+  say((ok ? 'PASS: ' : 'FAIL: ') + detail);
+  fetch('/result', { method: 'POST', body: JSON.stringify({ ok, detail, log }) }).catch(() => {});
+}
+
+async function ready(frame) {
+  for (let i = 0; i < 240; i++) {
+    const win = frame.contentWindow;
+    const doc = frame.contentDocument;
+    if (doc && doc.readyState === 'complete' && typeof win.enterOnline === 'function' && win.CannonRoom) {
+      if (win.eval('typeof GameState') === 'function' && win.eval('typeof PRESET_MAPS') === 'object') {
+        // 在 iframe 自己的 realm 里收集错误：内联 onclick 里被吞掉的 async 抛错必须能看见。
+        // 同时把 alert/confirm 换成不阻塞的替身，避免无头浏览器卡在弹窗上。
+        win.eval(`
+          window.__errs = [];
+          window.__alerts = [];
+          window.alert = (m) => window.__alerts.push(String(m));
+          window.confirm = () => true;
+          window.addEventListener('error', (e) => window.__errs.push('error: ' + e.message));
+          window.addEventListener('unhandledrejection', (e) =>
+            window.__errs.push('rejection: ' + ((e.reason && e.reason.stack) || e.reason)));
+        `);
+        return;
+      }
+    }
+    await wait(50);
+  }
+  throw new Error('iframe 未能加载出 app.js');
+}
+
+async function until(predicate, ms, label) {
+  const end = Date.now() + ms;
+  let i = 0;
+  while (Date.now() < end) {
+    let ok = false;
+    try { ok = predicate(); } catch { ok = false; }
+    if (ok) return;
+    if (++i % 25 === 0) fetch('/progress', { method: 'POST', body: '   …仍在等待: ' + label }).catch(() => {});
+    await wait(100);
+  }
+  throw new Error('超时: ' + label);
+}
+
+// 心跳：用来区分"父页面定时器卡住"和"某个步骤在正常等待"。
+let beat = 0;
+setInterval(() => {
+  beat++;
+  fetch('/progress', { method: 'POST', body: 'heartbeat #' + beat + ' (' + beat * 2 + 's)' }).catch(() => {});
+}, 2000);
+
+async function loadFrame(frame, query) {
+  frame.src = '/index.html?' + query;
+  await ready(frame);
+}
+
+async function enterOnline(frame) {
+  const doc = frame.contentDocument;
+  doc.querySelector('#screen-menu .menu-btn[onclick="enterOnline()"]').click();
+  await until(() => isActive(doc, 'screen-online-lobby'), 5000, '进入在线大厅');
+}
+
+/** 房主建房 → 加入方用小写房间号进房 → 双方进准备界面，返回房间号。 */
+async function hostAndJoin(frameA, frameB) {
+  const docA = frameA.contentDocument;
+  const docB = frameB.contentDocument;
+
+  docA.querySelector('#screen-online-lobby button[onclick="createRoom()"]').click();
+  await until(() => CODE_RE.test(docA.getElementById('room-code-display').textContent.trim()),
+    30000, '房主生成房间号');
+  const code = docA.getElementById('room-code-display').textContent.trim();
+
+  if (docA.getElementById('lobby-actions').style.display !== 'none') throw new Error('房主端未隐藏入口按钮');
+  if (docA.getElementById('room-panel').style.display !== 'block') throw new Error('房主端未显示房间号面板');
+  if (G(frameA.contentWindow, 'room.code') !== code) throw new Error('房间号与 room 状态不一致');
+
+  docB.getElementById('room-code-input').value = code.toLowerCase();   // 验证房间号归一化
+  docB.querySelector('#screen-online-lobby button[onclick="joinRoom()"]').click();
+
+  await until(() => isActive(docA, 'screen-online-ready') && isActive(docB, 'screen-online-ready'),
+    45000, '双方进入准备界面');
+  return code;
+}
+
+/** 从真实局面里挑一个"有合法走法"的棋子，返回 {fromR,fromC,toR,toC}。 */
+function pickMove(win, side) {
+  return JSON.parse(G(win, `JSON.stringify((function () {
+    for (const p of gameState.getAllPiecesForSide(${side})) {
+      gameState.selectPiece(p.r, p.c);
+      const moves = gameState.validMoves.slice();
+      gameState.deselectPiece();
+      if (moves.length) return { fromR: p.r, fromC: p.c, toR: moves[0].r, toC: moves[0].c };
+    }
+    return null;
+  })())`));
+}
+
+async function playRound(frameA, frameB, mode, label) {
+  const docA = frameA.contentDocument;
+  const docB = frameB.contentDocument;
+  const CA = frameA.contentWindow;
+  const CB = frameB.contentWindow;
+
+  say(label + ' 1) 双方进入在线大厅…');
+  await enterOnline(frameA);
+  await enterOnline(frameB);
+
+  say(label + ' 2) 房主建房，加入方输房间号进房（小写输入）…');
+  const code = await hostAndJoin(frameA, frameB);
+  say('   房间号 ' + code + '，双方已进入准备界面');
+
+  say(label + ' 3) 校验角色、界面可见性、连接方式…');
+  if (G(CA, 'playerSide') !== 1) throw new Error(label + ' 房主应为大炮方，实为 ' + G(CA, 'playerSide'));
+  if (G(CB, 'playerSide') !== 2) throw new Error(label + ' 加入方应为小鬼方，实为 ' + G(CB, 'playerSide'));
+  if (G(CA, 'room.transport') !== mode) throw new Error(label + ' 房主连接方式应为 ' + mode);
+  if (G(CB, 'room.transport') !== mode) throw new Error(label + ' 加入方连接方式应为 ' + mode);
+
+  const expectText = mode === 'p2p' ? '直连模式' : '中转模式';
+  for (const [doc, who] of [[docA, '房主'], [docB, '加入方']]) {
+    const meta = doc.getElementById('ready-meta').textContent;
+    if (meta.indexOf(expectText) === -1) throw new Error(label + ' ' + who + ' 准备界面未显示「' + expectText + '」: ' + meta);
+    if (meta.indexOf(code) === -1) throw new Error(label + ' ' + who + ' 准备界面未显示房间号: ' + meta);
+  }
+  if (docA.getElementById('ready-host-panel').style.display === 'none') throw new Error(label + ' 房主端未显示地图设置');
+  if (docB.getElementById('ready-host-panel').style.display !== 'none') throw new Error(label + ' 加入方不该看到地图设置');
+  if (docB.getElementById('ready-start-btn').style.display !== 'none') throw new Error(label + ' 加入方不该看到开始按钮');
+  say('   房主=大炮方可改地图，加入方=小鬼方只能等待，连接方式 ' + expectText);
+
+  say(label + ' 4) 房主在准备界面选第 2 张地图并开局…');
+  const presetBtns = docA.querySelectorAll('#preset-maps-online .preset-map-btn');
+  if (presetBtns.length !== G(CA, 'PRESET_MAPS.length')) {
+    throw new Error(label + ' 准备界面预设地图数量不对: ' + presetBtns.length);
+  }
+  presetBtns[1].click();
+  const preset1 = G(CA, 'JSON.stringify(presetToInitial(PRESET_MAPS[1]).board)');
+  if (docA.getElementById('board-width-online').value !== String(G(CA, 'PRESET_MAPS[1].width'))) {
+    throw new Error(label + ' 选地图后宽度输入框没跟着变');
+  }
+  docA.getElementById('ready-start-btn').click();
+
+  await until(() => isActive(docA, 'screen-game') && isActive(docB, 'screen-game'), 20000, '双方进入棋盘');
+  if (boardOf(CA) !== boardOf(CB)) throw new Error(label + ' 初始棋盘两端不一致');
+  if (boardOf(CA) !== preset1) throw new Error(label + ' 开局棋盘不是房主选的那张地图');
+  if (G(CA, 'gameMode') !== 'online' || G(CB, 'gameMode') !== 'online') throw new Error(label + ' gameMode 不是 online');
+  say('   双方开局棋盘一致，且等于房主选的地图 (' + G(CA, 'gameState.width') + '×' + G(CA, 'gameState.height') +
+    ' / 大炮 ' + G(CA, 'gameState.countCannons()') + ' / 小鬼 ' + G(CA, 'gameState.countGhosts()') + ')');
+
+  say(label + ' 5) 房主在真实棋盘上走一手…');
+  const cannonMove = pickMove(CA, 1);
+  if (!cannonMove) throw new Error(label + ' 找不到可走的大炮');
+  const beforeCannon = boardOf(CA);
+  cell(docA, cannonMove.fromR, cannonMove.fromC).click();
+  if (!G(CA, 'gameState.selectedPiece')) throw new Error(label + ' 点击己方大炮未选中');
+  cell(docA, cannonMove.toR, cannonMove.toC).click();
+  await until(() => G(CA, `gameState.getPiece(${cannonMove.toR},${cannonMove.toC})`) === 1 &&
+    G(CB, `gameState.getPiece(${cannonMove.toR},${cannonMove.toC})`) === 1 &&
+    boardOf(CA) === boardOf(CB) && turnOf(CA) === 2 && turnOf(CB) === 2,
+    20000, '房主走子同步到加入方');
+  if (boardOf(CA) === beforeCannon) throw new Error(label + ' 房主本地棋盘没有变化');
+  if (docB.getElementById('turn-text').textContent.indexOf('小鬼') === -1) {
+    throw new Error(label + ' 加入方回合提示未更新: ' + docB.getElementById('turn-text').textContent);
+  }
+  say('   加入方已重放该手，轮次交给小鬼方');
+
+  say(label + ' 6) 加入方在真实棋盘上走一手小鬼…');
+  const ghostMove = pickMove(CB, 2);
+  if (!ghostMove) throw new Error(label + ' 找不到可走的小鬼');
+  cell(docB, ghostMove.fromR, ghostMove.fromC).click();
+  if (!G(CB, 'gameState.selectedPiece')) throw new Error(label + ' 加入方点击小鬼未选中');
+  cell(docB, ghostMove.toR, ghostMove.toC).click();
+  await until(() => G(CB, `gameState.getPiece(${ghostMove.toR},${ghostMove.toC})`) === 2 &&
+    G(CA, `gameState.getPiece(${ghostMove.toR},${ghostMove.toC})`) === 2 &&
+    boardOf(CA) === boardOf(CB) && turnOf(CA) === 1 && turnOf(CB) === 1,
+    20000, '加入方走子同步到房主');
+  if (docA.getElementById('turn-text').textContent.indexOf('大炮') === -1) {
+    throw new Error(label + ' 房主回合提示未更新: ' + docA.getElementById('turn-text').textContent);
+  }
+  say('   房主已重放该手，轮次交回大炮方');
+
+  say(label + ' 7) 校验两端规则一致 + 非当前回合点不动对方棋子…');
+  const capsExpr = 'gameState.getAllPiecesForSide(1).map(p => gameState.getCaptureMoves(p.r, p.c).length).join(",")';
+  if (G(CA, capsExpr) !== G(CB, capsExpr)) throw new Error(label + ' 两端可用吃子数不一致');
+
+  const ghostPiece = JSON.parse(G(CA, 'JSON.stringify(gameState.getAllPiecesForSide(2)[0])'));
+  const beforeWrongTurn = boardOf(CB);
+  cell(docB, ghostPiece.r, ghostPiece.c).click();   // 轮到房主，加入方不该能选中自己的小鬼
+  if (G(CB, 'gameState.selectedPiece')) throw new Error(label + ' 非当前回合仍能选中棋子');
+  if (boardOf(CB) !== beforeWrongTurn) throw new Error(label + ' 非当前回合的点击改变了棋盘');
+  say('   两端吃子数一致，非当前回合点击被正确忽略');
+
+  return { code, preset1 };
+}
+
+(async () => {
+  const runtimeErrors = [];
+  try {
+    const A = document.getElementById('fa');
+    const B = document.getElementById('fb');
+    const D = document.getElementById('fd');
+    const E = document.getElementById('fe');
+    const F = document.getElementById('ff');
+
+    // ---------- 直连模式 ----------
+    await loadFrame(A, BROKER_QUERY);
+    await loadFrame(B, BROKER_QUERY);
+    const round1 = await playRound(A, B, 'p2p', '【直连】');
+
+    // ---------- 重开的两条路径 ----------
+    const docA = A.contentDocument;
+    const docB = B.contentDocument;
+    const CA = A.contentWindow;
+    const CB = B.contentWindow;
+
+    say('【直连】 8) 加入方点「再来一局」，房主应重置双方棋盘…');
+    const initial = round1.preset1;
+    G(CB, 'restartGame()');
+    await until(() => boardOf(CA) === boardOf(CB) && boardOf(CA) === initial && turnOf(CA) === 1 && turnOf(CB) === 1,
+      20000, '加入方请求重开同步');
+    say('   双方已重置为房主选的初始局面（restartRequest → start 路径）');
+
+    say('【直连】 9) 房主先走一手，再点「再来一局」…');
+    const advance = pickMove(CA, 1);
+    cell(docA, advance.fromR, advance.fromC).click();
+    cell(docA, advance.toR, advance.toC).click();
+    await until(() => boardOf(CA) === boardOf(CB) && turnOf(CA) === 2, 20000, '重开前先走一手');
+    G(CA, 'restartGame()');
+    await until(() => boardOf(CA) === boardOf(CB) && boardOf(CA) === initial && turnOf(CA) === 1, 20000, '房主直接重开同步');
+    say('   双方已重置（房主直发 start 路径）');
+
+    say('【直连】 10) 第三个页面抢同一房间号，应被拒绝且不影响房内对局…');
+    await loadFrame(F, BROKER_QUERY);
+    await enterOnline(F);
+    const docF = F.contentDocument;
+    const CF = F.contentWindow;
+    docF.getElementById('room-code-input').value = round1.code;
+    docF.querySelector('#screen-online-lobby button[onclick="joinRoom()"]').click();
+    await until(() => G(CF, '__alerts').some((m) => m.indexOf('已经有对手') !== -1), 20000, '第三人被拒绝');
+    if (G(CF, 'room') !== null) throw new Error('第三人被拒后没有清理房间状态');
+    await wait(500);
+    if (!isActive(docA, 'screen-game') || !isActive(docB, 'screen-game')) throw new Error('房内对局被第三人影响');
+    if (boardOf(CA) !== boardOf(CB)) throw new Error('房内对局因此不同步');
+    say('   第三人收到「已经有对手了」，房内对局不受影响');
+
+    // ---------- 强制中继模式 ----------
+    const relayQuery = (BROKER_QUERY ? BROKER_QUERY + '&' : '') + 'transport=relay';
+    await loadFrame(D, relayQuery);
+    await loadFrame(E, relayQuery);
+    await playRound(D, E, 'relay', '【中继】');
+
+    // ---------- 本地 / 人机冒烟 ----------
+    say('【本地/人机】 11) 冒烟测试…');
+    F.contentWindow.eval('leaveOnline()');
+    await until(() => isActive(docF, 'screen-menu'), 5000, '返回主菜单');
+
+    docF.querySelector('#screen-menu .menu-btn[onclick*="local-setup"]').click();
+    docF.querySelector('#screen-local-setup .start-btn').click();
+    await until(() => isActive(docF, 'screen-game') && G(CF, 'gameState'), 8000, '本地对局开局');
+    const localMove = pickMove(CF, 1);
+    cell(docF, localMove.fromR, localMove.fromC).click();
+    cell(docF, localMove.toR, localMove.toC).click();
+    if (G(CF, 'gameState.currentTurn') !== 2) throw new Error('本地对局走子后轮次不对: ' + G(CF, 'gameState.currentTurn'));
+    say('   本地对局可开局、可走子');
+
+    docF.querySelector('#screen-menu .menu-btn[onclick*="ai-setup"]').click();
+    docF.querySelector('#screen-ai-setup .start-btn').click();
+    await until(() => isActive(docF, 'screen-game') && G(CF, 'gameState.countCannons()') > 0, 8000, '人机对局开局');
+    say('   人机对局可开局（大炮 ' + G(CF, 'gameState.countCannons()') + ' 门 / 小鬼 ' + G(CF, 'gameState.countGhosts()') + ' 只）');
+
+    say('12) 收集各页面里被吞掉的异常…');
+    if (runtimeErrors.length) throw new Error('页面运行时报错: ' + runtimeErrors.join(' | '));
+    for (const [frame, who] of [[A, '直连房主'], [B, '直连加入方'], [D, '中继房主'], [E, '中继加入方'], [F, '本地/人机']]) {
+      const errs = G(frame.contentWindow, 'window.__errs.join(" | ")');
+      if (errs) throw new Error(who + ' 页面内异常: ' + errs);
+    }
+
+    report(true, '完整联机流程通过：房间号 ' + round1.code +
+      ' → 双方准备界面 → 房主选地图开局 → 双方走子一致（直连模式 + 强制中继模式各一遍）');
+  } catch (e) {
+    // 失败时把各 iframe 里被吞掉的 alert / 异常一起带出来，否则只能看到一句"超时"。
+    let extra = '';
+    for (const [id, who] of [['fa', '页A'], ['fb', '页B'], ['fd', '页D'], ['fe', '页E'], ['ff', '页F']]) {
+      try {
+        const win = document.getElementById(id).contentWindow;
+        const alerts = win.__alerts || [];
+        const errs = win.__errs || [];
+        if (alerts.length) extra += '\n' + who + ' alert: ' + alerts.join(' | ');
+        if (errs.length) extra += '\n' + who + ' err: ' + errs.join(' | ');
+        extra += '\n' + who + ' state: screen=' + win.eval('currentScreen') +
+          ' room=' + win.eval('room ? room.transport || "未定" : "无"');
+      } catch { /* 该页还没起来 */ }
+    }
+    report(false, ((e && e.stack) || String(e)) + extra);
+  }
+})();
+</script>
+</body>
+</html>

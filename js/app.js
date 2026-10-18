@@ -6,12 +6,14 @@ let gameState = null;
 let editorState = null;
 let editorMode = null;
 let editorTool = 'cannon';
-let selectedPresetLocal = 0;
-let selectedPresetAI = 0;
 let customPositions = null;
 let customSource = null;
 let boardElement = null;
 let cellSize = 60;
+
+// 本地 / 人机 / 在线三种模式共用同一套"预设 + 自定义"状态，按模式下标取用。
+const selectedPreset = { local: 0, ai: 0, online: 0 };
+const SETUP_SCREEN = { local: 'local-setup', ai: 'ai-setup', online: 'online-ready' };
 
 function showScreen(name) {
   AudioManager.playClick();
@@ -22,27 +24,21 @@ function showScreen(name) {
     currentScreen = name;
   }
 
-  if (name === 'local-setup' || name === 'ai-setup') {
-    renderPresetMaps(name === 'local-setup' ? 'local' : 'ai');
-  } else if (name === 'online-lobby') {
-    renderOnlinePresets();
-  }
+  const presetMode = { 'local-setup': 'local', 'ai-setup': 'ai', 'online-ready': 'online' }[name];
+  if (presetMode) renderPresetMaps(presetMode);
 }
 
 function renderPresetMaps(mode) {
   const container = document.getElementById('preset-maps-' + mode);
+  if (!container) return;
   container.innerHTML = '';
   PRESET_MAPS.forEach((map, i) => {
     const btn = document.createElement('button');
-    btn.className = 'preset-map-btn' + ((mode === 'local' ? selectedPresetLocal : selectedPresetAI) === i ? ' selected' : '');
+    btn.className = 'preset-map-btn' + (selectedPreset[mode] === i ? ' selected' : '');
     btn.innerHTML = `<span class="map-name">${map.name}</span><span class="map-desc">${map.desc}</span>`;
     btn.onclick = () => {
       AudioManager.playClick();
-      if (mode === 'local') {
-        selectedPresetLocal = i;
-      } else {
-        selectedPresetAI = i;
-      }
+      selectedPreset[mode] = i;
       renderPresetMaps(mode);
       document.getElementById('board-width-' + mode).value = map.width;
       document.getElementById('board-height-' + mode).value = map.height;
@@ -76,8 +72,7 @@ function showEditor(mode) {
   editorState = new GameState(w, h);
   customSource = mode;
 
-  const presetIdx = mode === 'local' ? selectedPresetLocal : selectedPresetAI;
-  const preset = PRESET_MAPS[presetIdx];
+  const preset = PRESET_MAPS[selectedPreset[mode]];
 
   if (preset.width === w && preset.height === h) {
     for (const [r, c] of preset.cannons) editorState.placeCannon(r, c);
@@ -205,7 +200,7 @@ function drawGridLines(canvas, w, h, cs) {
 
 function backFromEditor() {
   AudioManager.playClick();
-  showScreen(editorMode === 'local' ? 'local-setup' : 'ai-setup');
+  showScreen(SETUP_SCREEN[editorMode] || 'menu');
 }
 
 function confirmEditor() {
@@ -215,7 +210,7 @@ function confirmEditor() {
     height: editorState.height,
     board: editorState.board.map(row => [...row])
   };
-  showScreen(editorMode === 'local' ? 'local-setup' : 'ai-setup');
+  showScreen(SETUP_SCREEN[editorMode] || 'menu');
 }
 
 function startLocalGame() {
@@ -225,8 +220,7 @@ function startLocalGame() {
   if (customPositions && customSource === 'local') {
     initGameFromCustom();
   } else {
-    const preset = PRESET_MAPS[selectedPresetLocal];
-    initGameFromPreset(preset);
+    initGameFromPreset(PRESET_MAPS[selectedPreset.local]);
   }
 }
 
@@ -237,8 +231,7 @@ function startAIGame() {
   if (customPositions && customSource === 'ai') {
     initGameFromCustom();
   } else {
-    const preset = PRESET_MAPS[selectedPresetAI];
-    initGameFromPreset(preset);
+    initGameFromPreset(PRESET_MAPS[selectedPreset.ai]);
   }
 }
 
@@ -500,17 +493,15 @@ function restartGame() {
   gameState = null;
 
   if (gameMode === 'local') {
-    const preset = PRESET_MAPS[selectedPresetLocal];
-    initGameFromPreset(preset);
+    initGameFromPreset(PRESET_MAPS[selectedPreset.local]);
   } else if (gameMode === 'ai') {
-    const preset = PRESET_MAPS[selectedPresetAI];
-    initGameFromPreset(preset);
+    initGameFromPreset(PRESET_MAPS[selectedPreset.ai]);
   } else if (gameMode === 'online') {
     // 局面由房主持有，所以只有房主能直接开新局，加入方发请求。
     if (playerSide === CANNON) {
-      sendOnlineRestart();
-    } else if (p2p && p2p.isOpen()) {
-      p2p.send('restartRequest', {});
+      startOnlineMatch();
+    } else if (room && room.isReady()) {
+      room.send('restartRequest', {});
       setStatus('已请求房主重开一局…');
     } else {
       setStatus('对手已断开，无法重开');
@@ -521,40 +512,26 @@ function restartGame() {
 function backToMenu() {
   AudioManager.playClick();
   document.getElementById('game-over-modal').style.display = 'none';
-  closeOnlineConnection(true);
+  closeRoom(true);
   gameState = null;
-  resetLobbyPanels();
+  showLobbyEntry();
   showScreen('menu');
 }
 
 function confirmQuit() {
   if (confirm('确定要退出当前对局吗？')) {
     AudioManager.playClick();
-    closeOnlineConnection(true);
+    closeRoom(true);
     gameState = null;
-    resetLobbyPanels();
+    showLobbyEntry();
     showScreen('menu');
   }
 }
 
-/* ---------------- 在线对局：WebRTC 直连（人工转发信令，无需服务器） ---------------- */
+/* ---------------- 在线对局：公共 MQTT 房间 + 优先走 WebRTC 直连 ---------------- */
 
-let p2p = null;
-let onlineInitial = null;       // 房主选定的初始局面 {width, height, board}
-let selectedOnlinePreset = 0;
-
-function renderOnlinePresets() {
-  const select = document.getElementById('online-preset');
-  if (!select || select.options.length) return;
-  PRESET_MAPS.forEach((map, i) => {
-    const option = document.createElement('option');
-    option.value = String(i);
-    option.textContent = map.name + ' · ' + map.desc;
-    select.appendChild(option);
-  });
-  select.value = String(selectedOnlinePreset);
-  select.onchange = () => { selectedOnlinePreset = Number(select.value); };
-}
+let room = null;
+let onlineInitial = null;       // 房主本局采用的初始局面 {width, height, board}
 
 function presetToInitial(preset) {
   const state = new GameState(preset.width, preset.height);
@@ -563,128 +540,217 @@ function presetToInitial(preset) {
   return { width: state.width, height: state.height, board: state.board.map(row => [...row]) };
 }
 
+/** 房主在准备界面选定的初始局面（预设地图，或编辑过的自定义局面）。 */
+function currentOnlineInitial() {
+  if (customPositions && customSource === 'online') {
+    return {
+      width: customPositions.width,
+      height: customPositions.height,
+      board: customPositions.board.map(row => [...row])
+    };
+  }
+  return presetToInitial(PRESET_MAPS[selectedPreset.online]);
+}
+
 function setLobbyStatus(message) {
   const el = document.getElementById('lobby-status');
   if (el) el.textContent = message || '';
 }
 
-function resetLobbyPanels() {
+function showLobbyEntry() {
   const actions = document.getElementById('lobby-actions');
   if (actions) actions.style.display = '';
-  for (const id of ['relay-panel', 'answer-panel']) {
-    const panel = document.getElementById(id);
-    if (panel) panel.style.display = 'none';
-  }
-  const copied = document.getElementById('relay-copied');
-  if (copied) copied.textContent = '';
-  setLobbyStatus('');
+  const panel = document.getElementById('room-panel');
+  if (panel) panel.style.display = 'none';
 }
 
-function showRelayPanel(code, hint) {
-  document.getElementById('lobby-actions').style.display = 'none';
-  document.getElementById('relay-panel').style.display = 'block';
-  document.getElementById('relay-hint').textContent = hint;
-  document.getElementById('relay-output').value = code;
-}
-
-function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    return navigator.clipboard.writeText(text);
-  }
-  // file:// 或纯 http 下的兜底方案
-  const box = document.getElementById('relay-output');
-  box.removeAttribute('readonly');
-  box.select();
-  let ok = false;
-  try { ok = document.execCommand('copy'); } catch { ok = false; }
-  box.setAttribute('readonly', 'readonly');
-  return ok ? Promise.resolve() : Promise.reject(new Error('copy_failed'));
-}
-
-function copyRelayCode() {
-  AudioManager.playClick();
-  const box = document.getElementById('relay-output');
-  const tag = document.getElementById('relay-copied');
-  copyText(box.value).then(() => {
-    tag.textContent = ' ✓ 已复制';
-    setTimeout(() => { tag.textContent = ''; }, 1500);
-  }).catch(() => {
-    box.select();
-    tag.textContent = ' 复制失败，请手动全选复制';
-  });
-}
-
-function backFromRelay() {
-  AudioManager.playClick();
-  closeOnlineConnection(true);
-  resetLobbyPanels();
-}
-
-function leaveOnline() {
-  AudioManager.playClick();
-  closeOnlineConnection(true);
-  resetLobbyPanels();
-  showScreen('menu');
-}
-
-function resetP2P() {
-  closeOnlineConnection(false);
-  onlineInitial = null;
-}
-
-function closeOnlineConnection(notifyPeer) {
-  if (p2p) {
-    if (notifyPeer && p2p.isOpen()) p2p.send('bye', {});
-    p2p.close();
-    p2p = null;
+function closeRoom(notify) {
+  if (room) {
+    room.close(notify);
+    room = null;
   }
 }
 
-function peerHandlers() {
+function resetRoom() {
+  closeRoom(false);
+}
+
+function roomHandlers() {
   return {
-    onOpen: onPeerOpen,
-    onMessage: handlePeerMessage,
-    onState: (state) => {
-      const cs = state.connectionState;
-      if (cs === 'failed') {
-        setLobbyStatus('直连失败：双方可能都在对称 NAT 后，需要 TURN 中继（见 README）');
-        if (gameMode === 'online') setStatus('直连失败：网络无法穿透');
-      } else if (cs === 'connecting') {
-        setLobbyStatus('正在打通直连…');
-      } else if (cs === 'connected') {
-        setLobbyStatus('直连已建立');
+    onStatus: (status) => {
+      if (status.phase === 'connecting') {
+        setLobbyStatus('正在连接中转服务器 ' + status.index + '/' + status.total + '…');
+      } else if (status.phase === 'waiting') {
+        setLobbyStatus('房间已创建，等待对手加入…');
+      } else if (status.phase === 'joining') {
+        setLobbyStatus('正在寻找房间 ' + status.code + '…');
+      } else if (status.phase === 'negotiating') {
+        setLobbyStatus('已找到对手，正在尝试直连…');
       }
     },
-    onClose: () => {
-      if (gameMode === 'online' && gameState && !gameState.gameOver) {
-        setStatus('对手已断开连接');
-      }
+    onReady: showReadyScreen,
+    onMessage: handlePeerMessage,
+    onError: (error) => {
+      resetRoom();
+      showLobbyEntry();
+      setLobbyStatus(error.message);
+      alert(error.message);
+    },
+    onClosed: (reason) => {
+      if (gameMode === 'online' && gameState && !gameState.gameOver) setStatus(reason);
     }
   };
 }
 
-function onPeerOpen() {
-  setLobbyStatus('直连已建立！');
-  // 局面由房主决定并下发，加入方收到 init 后才进入棋盘。
-  if (playerSide === CANNON && onlineInitial) {
-    p2p.send('init', onlineInitial);
-    startOnlineGame(onlineInitial);
+async function createRoom() {
+  AudioManager.playClick();
+  resetRoom();
+  showLobbyEntry();
+  setLobbyStatus('正在连接中转服务器…');
+
+  try {
+    room = new CannonRoom.GameRoom(roomHandlers());
+    const code = await room.host();
+    document.getElementById('room-code-display').textContent = code;
+    document.getElementById('lobby-actions').style.display = 'none';
+    document.getElementById('room-panel').style.display = 'block';
+    setLobbyStatus('房间已创建，等待对手加入…');
+  } catch (error) {
+    resetRoom();
+    setLobbyStatus(error.message);
+    alert(error.message);
   }
+}
+
+async function joinRoom() {
+  AudioManager.playClick();
+  const input = document.getElementById('room-code-input');
+  const code = CannonRoom.normalizeRoomCode(input.value);
+  input.value = code;
+
+  if (code.length !== 6) {
+    alert('请输入 6 位房间号');
+    return;
+  }
+
+  resetRoom();
+  showLobbyEntry();
+  setLobbyStatus('正在加入房间 ' + code + '…');
+
+  try {
+    room = new CannonRoom.GameRoom(roomHandlers());
+    await room.join(code);
+  } catch (error) {
+    resetRoom();
+    setLobbyStatus(error.message);
+    alert(error.message);
+  }
+}
+
+/** 剪贴板在 file:// 或纯 http 下不可用，退回 execCommand。 */
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  const input = document.createElement('textarea');
+  input.value = text;
+  input.setAttribute('readonly', 'readonly');
+  input.style.position = 'fixed';
+  input.style.opacity = '0';
+  document.body.appendChild(input);
+  input.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch { ok = false; }
+  document.body.removeChild(input);
+  return ok ? Promise.resolve() : Promise.reject(new Error('copy_failed'));
+}
+
+function copyRoomCode() {
+  AudioManager.playClick();
+  const code = document.getElementById('room-code-display').textContent.trim();
+  const tag = document.getElementById('room-code-copied');
+  copyText(code).then(() => {
+    tag.textContent = ' ✓ 已复制';
+    setTimeout(() => { tag.textContent = ''; }, 1500);
+  }).catch(() => {
+    tag.textContent = ' 复制失败，请手动记下';
+  });
+}
+
+function cancelRoom() {
+  AudioManager.playClick();
+  resetRoom();
+  showLobbyEntry();
+  setLobbyStatus('');
+}
+
+function leaveOnline() {
+  AudioManager.playClick();
+  resetRoom();
+  showLobbyEntry();
+  setLobbyStatus('');
+  showScreen('menu');
+}
+
+function enterOnline() {
+  AudioManager.playClick();
+  resetRoom();
+  showLobbyEntry();
+  setLobbyStatus('');
+  const input = document.getElementById('room-code-input');
+  if (input) input.value = '';
+  showScreen('online-lobby');
+}
+
+/* 连上之后双方都先到准备界面：房主选地图，加入方等待。 */
+function showReadyScreen(info) {
+  const isHost = info.role === 'host';
+  playerSide = isHost ? CANNON : GHOST;
+
+  document.getElementById('ready-role').textContent =
+    playerSide === CANNON ? '💣 你是大炮方（先手）' : '👻 你是小鬼方';
+  document.getElementById('ready-meta').textContent =
+    '房间 ' + info.code + ' · ' + (info.transport === 'p2p' ? '直连模式' : '中转模式');
+  document.getElementById('ready-host-panel').style.display = isHost ? '' : 'none';
+  document.getElementById('ready-guest-panel').style.display = isHost ? 'none' : '';
+  document.getElementById('ready-start-btn').style.display = isHost ? '' : 'none';
+
+  showScreen('online-ready');
+}
+
+/** 房主开始对局：把选定的局面下发给加入方，双方同时进棋盘。 */
+function startOnlineMatch() {
+  AudioManager.playClick();
+  if (!room || !room.isReady()) {
+    alert('对手还没有进来');
+    return;
+  }
+  onlineInitial = currentOnlineInitial();
+  room.send('start', onlineInitial);
+  startOnlineGame(onlineInitial);
+}
+
+function leaveReady() {
+  AudioManager.playClick();
+  resetRoom();
+  showLobbyEntry();
+  setLobbyStatus('');
+  showScreen('menu');
 }
 
 function handlePeerMessage(message) {
   if (!message || typeof message !== 'object') return;
 
   switch (message.type) {
-    case 'init':
-    case 'restart':
+    case 'start':
       startOnlineGame(message);
       break;
     case 'move':
       applyRemoteMove(message);
       break;
     case 'restartRequest':
-      if (playerSide === CANNON) sendOnlineRestart();
+      // 重开由房主（大炮方）决定，并重新下发一次局面。
+      if (playerSide === CANNON) startOnlineMatch();
       break;
     case 'bye':
       setStatus('对手已离开对局');
@@ -704,16 +770,7 @@ function startOnlineGame(data) {
   showScreen('game');
   renderGameBoard();
   updateGameUI();
-  setStatus(playerSide === CANNON ? '在线直连 · 你是大炮方 💣' : '在线直连 · 你是小鬼方 👻');
-}
-
-function sendOnlineRestart() {
-  if (!p2p || !p2p.isOpen() || !onlineInitial) {
-    setStatus('对手已断开，无法重开');
-    return;
-  }
-  p2p.send('restart', onlineInitial);
-  startOnlineGame(onlineInitial);
+  setStatus(playerSide === CANNON ? '在线对局 · 你是大炮方 💣' : '在线对局 · 你是小鬼方 👻');
 }
 
 function applyRemoteMove(message) {
@@ -737,82 +794,9 @@ function applyRemoteMove(message) {
   if (gameState.gameOver) handleGameOver();
 }
 
-async function createRoom() {
-  AudioManager.playClick();
-  if (typeof RTCPeerConnection === 'undefined') {
-    alert('当前浏览器不支持 WebRTC，无法直连');
-    return;
-  }
-
-  resetP2P();
-  resetLobbyPanels();
-  playerSide = CANNON;
-  onlineInitial = presetToInitial(PRESET_MAPS[selectedOnlinePreset]);
-
-  try {
-    p2p = new P2PConnection(peerHandlers());
-    const offerCode = await p2p.createOffer();
-    showRelayPanel(offerCode, '① 把这段邀请码发给对手（QQ / 微信均可）');
-    document.getElementById('answer-panel').style.display = 'block';
-    setLobbyStatus('等待对手回传应答码…');
-  } catch (e) {
-    p2p = null;
-    alert('生成邀请码失败: ' + e.message);
-  }
-}
-
-async function joinRoom() {
-  AudioManager.playClick();
-  if (typeof RTCPeerConnection === 'undefined') {
-    alert('当前浏览器不支持 WebRTC，无法直连');
-    return;
-  }
-
-  const offerCode = document.getElementById('offer-input').value;
-  if (!offerCode.trim()) {
-    alert('请先粘贴房主发来的邀请码');
-    return;
-  }
-
-  resetP2P();
-  resetLobbyPanels();
-  playerSide = GHOST;
-
-  try {
-    p2p = new P2PConnection(peerHandlers());
-    const answerCode = await p2p.acceptOffer(offerCode);
-    showRelayPanel(answerCode, '② 把这段应答码回传房主，等他点「连接对手」…');
-    setLobbyStatus('等待房主连接…');
-  } catch (e) {
-    p2p = null;
-    alert('邀请码无效: ' + e.message);
-  }
-}
-
-async function finishConnection() {
-  AudioManager.playClick();
-  if (!p2p) {
-    alert('请先点「生成邀请码」');
-    return;
-  }
-
-  const answerCode = document.getElementById('answer-input').value;
-  if (!answerCode.trim()) {
-    alert('请粘贴对手回传的应答码');
-    return;
-  }
-
-  try {
-    await p2p.acceptAnswer(answerCode);
-    setLobbyStatus('应答码已接受，正在打通直连…');
-  } catch (e) {
-    alert('应答码无效: ' + e.message);
-  }
-}
-
-async function submitOnlineMove(fromR, fromC, toR, toC) {
-  if (!p2p || !p2p.isOpen()) {
-    setStatus('尚未与对手建立直连');
+function submitOnlineMove(fromR, fromC, toR, toC) {
+  if (!room || !room.isReady()) {
+    setStatus('尚未与对手建立连接');
     return false;
   }
 
@@ -824,7 +808,7 @@ async function submitOnlineMove(fromR, fromC, toR, toC) {
   updateGameUI();
 
   // 双方跑同一套规则，所以只需同步这一手，不必同步整个棋盘。
-  p2p.send('move', { fromR, fromC, toR, toC });
+  room.send('move', { fromR, fromC, toR, toC });
 
   if (gameState.gameOver) handleGameOver();
   return true;

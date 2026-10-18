@@ -27,7 +27,7 @@
             <span class="btn-text">人机对局</span>
             <span class="btn-desc">选择阵营挑战电脑</span>
           </button>
-          <button class="menu-btn" onclick="showScreen('online-lobby')">
+          <button class="menu-btn" onclick="enterOnline()">
             <span class="btn-icon">🌐</span>
             <span class="btn-text">在线对局</span>
             <span class="btn-desc">创建或加入房间</span>
@@ -172,55 +172,94 @@
       </div>
     </div>
 
-    <!-- Online Lobby (WebRTC 直连) -->
+    <!-- Online Lobby -->
     <div id="screen-online-lobby" class="screen">
       <div class="lobby-container">
-        <h2>在线对局 · 直连</h2>
+        <h2>在线对局</h2>
         <p class="lobby-hint">
-          无需服务器：双方交换两段代码即可点对点连接。<br>
-          房主执 💣 大炮方并决定地图，加入方执 👻 小鬼方。
+          房主创建房间会得到一个 6 位房间号，把它发给对手；对手输入房间号即可加入。<br>
+          房主执 💣 大炮方，加入方执 👻 小鬼方，地图由房主在准备界面决定。
         </p>
 
         <div class="lobby-actions" id="lobby-actions">
           <div class="lobby-card">
-            <h3>我是房主</h3>
-            <p>生成邀请码，发给对手</p>
-            <div class="setting-row">
-              <label>地图:</label>
-              <select id="online-preset"></select>
-            </div>
-            <button class="action-btn" onclick="createRoom()">生成邀请码</button>
+            <h3>创建房间</h3>
+            <p>生成房间号并把它发给对手</p>
+            <button class="action-btn" onclick="createRoom()">创建房间</button>
           </div>
           <div class="lobby-card">
-            <h3>我加入</h3>
-            <p>粘贴房主发来的邀请码</p>
-            <textarea id="offer-input" class="code-box" spellcheck="false"
-                      placeholder="在这里粘贴邀请码…"></textarea>
-            <button class="action-btn" onclick="joinRoom()">生成应答码</button>
+            <h3>加入房间</h3>
+            <p>输入房主给你的房间号</p>
+            <input type="text" id="room-code-input" class="code-input" maxlength="6"
+                   placeholder="6 位房间号" autocomplete="off" autocapitalize="characters" spellcheck="false">
+            <button class="action-btn" onclick="joinRoom()">加入房间</button>
           </div>
         </div>
 
-        <div id="relay-panel" class="relay-panel" style="display:none;">
-          <p class="relay-hint" id="relay-hint"></p>
-          <textarea id="relay-output" class="code-box" readonly spellcheck="false"></textarea>
+        <div id="room-panel" class="relay-panel" style="display:none;">
+          <p class="relay-hint">把房间号发给对手，他输入后你们会自动进入准备界面。</p>
+          <div class="room-code-display" id="room-code-display">------</div>
           <div class="relay-actions">
-            <button class="action-btn" onclick="copyRelayCode()">复制这段代码<span id="relay-copied" class="copied-tag"></span></button>
-            <button class="back-btn" onclick="backFromRelay()">取消</button>
-          </div>
-        </div>
-
-        <div id="answer-panel" class="relay-panel" style="display:none;">
-          <p class="relay-hint">把对手回传的应答码粘贴到这里，然后点「连接」。</p>
-          <textarea id="answer-input" class="code-box" spellcheck="false"
-                    placeholder="在这里粘贴应答码…"></textarea>
-          <div class="relay-actions">
-            <button class="action-btn" onclick="finishConnection()">连接对手</button>
-            <button class="back-btn" onclick="backFromRelay()">取消</button>
+            <button class="action-btn" onclick="copyRoomCode()">复制房间号<span id="room-code-copied" class="copied-tag"></span></button>
+            <button class="back-btn" onclick="cancelRoom()">取消</button>
           </div>
         </div>
 
         <div id="lobby-status" class="lobby-status"></div>
         <button class="back-btn" onclick="leaveOnline()">返回菜单</button>
+      </div>
+    </div>
+
+    <!-- Online Ready Screen（双方都先到这里；地图由房主决定） -->
+    <div id="screen-online-ready" class="screen">
+      <div class="setup-container">
+        <h2>对局准备</h2>
+
+        <div class="ready-banner">
+          <span class="ready-role" id="ready-role">💣 你是大炮方</span>
+          <span class="ready-meta" id="ready-meta">房间 ------</span>
+        </div>
+
+        <div id="ready-host-panel">
+          <div class="setup-section">
+            <h3>选择预设地图</h3>
+            <div class="preset-maps" id="preset-maps-online"></div>
+          </div>
+          <div class="setup-section">
+            <h3>自定义设置</h3>
+            <div class="custom-settings">
+              <div class="setting-row">
+                <label>棋盘宽度:</label>
+                <input type="number" id="board-width-online" min="4" max="15" value="6">
+              </div>
+              <div class="setting-row">
+                <label>棋盘高度:</label>
+                <input type="number" id="board-height-online" min="4" max="15" value="6">
+              </div>
+              <div class="setting-row">
+                <label>大炮数量:</label>
+                <input type="number" id="cannon-count-online" min="1" max="10" value="2">
+              </div>
+              <div class="setting-row">
+                <label>小鬼数量:</label>
+                <input type="number" id="ghost-count-online" min="1" max="50" value="18">
+              </div>
+            </div>
+            <button class="action-btn" onclick="showEditor('online')">编辑初始位置</button>
+          </div>
+        </div>
+
+        <div id="ready-guest-panel" style="display:none;">
+          <div class="setup-section ready-waiting">
+            <div class="waiting-spinner"></div>
+            <p>已连上房主，等待他选择地图并开始对局…</p>
+          </div>
+        </div>
+
+        <div class="setup-actions">
+          <button class="back-btn" onclick="leaveReady()">退出房间</button>
+          <button class="start-btn" id="ready-start-btn" onclick="startOnlineMatch()">开始游戏</button>
+        </div>
       </div>
     </div>
 
@@ -315,7 +354,8 @@
   <script src="js/audio.js"></script>
   <script src="js/game.js"></script>
   <script src="js/ai.js"></script>
-  <script src="js/webrtc.js"></script>
+  <script src="js/mqtt.js"></script>
+  <script src="js/room.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

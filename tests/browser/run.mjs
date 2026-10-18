@@ -1,0 +1,99 @@
+/*
+ * 浏览器端 E2E：起一个临时静态服务器，用无头 Chrome/Edge 加载 tests/browser/handshake.html。
+ * 该页面会在三个同源 iframe 里各跑一份真实的 index.html，完整走一遍：
+ *   联机大厅 → 邀请码 → 应答码 → 自动开局 → 双方走子同步 → 两条重开路径 → 本地/人机冒烟
+ * 之所以必须用真浏览器：WebRTC 握手、剪贴板之外的 DOM 流程、以及内联 onclick 里被吞掉的
+ * async 报错，都只有真环境才暴露得出来。
+ *
+ * 用法:  node tests/browser/run.mjs  [浏览器可执行文件路径]
+ */
+import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { dirname, extname, join, normalize, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const HARNESS = 'tests/browser/handshake.html';
+const TIMEOUT_MS = Number(process.env.E2E_TIMEOUT_MS || 180000);
+
+const CANDIDATES = [
+  process.argv[2],
+  process.env.CHROME_PATH,
+  join(process.env.ProgramFiles || '', 'Google/Chrome/Application/chrome.exe'),
+  join(process.env['ProgramFiles(x86)'] || '', 'Google/Chrome/Application/chrome.exe'),
+  join(process.env['ProgramFiles(x86)'] || '', 'Microsoft/Edge/Application/msedge.exe'),
+  join(process.env.ProgramFiles || '', 'Microsoft/Edge/Application/msedge.exe'),
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+].filter(Boolean);
+
+const browser = CANDIDATES.find((path) => existsSync(path));
+if (!browser) {
+  console.error('找不到 Chrome/Edge，请显式传入路径：node tests/browser/run.mjs <浏览器路径>');
+  process.exit(2);
+}
+
+const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+
+let child = null;
+let settled = false;
+function finish(code) {
+  if (settled) return;
+  settled = true;
+  try { server.close(); } catch { /* ignore */ }
+  try { child?.kill(); } catch { /* ignore */ }
+  process.exit(code);
+}
+
+const server = createServer(async (req, res) => {
+  if (req.method === 'POST' && (req.url === '/progress' || req.url === '/result')) {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    if (req.url === '/progress') {
+      console.log('  · ' + body);
+      return res.end('ok');
+    }
+    const result = JSON.parse(body);
+    console.log(result.ok ? '\n✅ 浏览器 E2E 通过：' + result.detail : '\n❌ 浏览器 E2E 失败：' + result.detail);
+    res.end('ok');
+    return setTimeout(() => finish(result.ok ? 0 : 1), 150);
+  }
+
+  let path = decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname);
+  if (path === '/') path = '/' + HARNESS;
+  const target = join(ROOT, normalize(path).replace(/^(\.\.[/\\])+/, '').replace(/^[/\\]/, ''));
+  if (!target.startsWith(ROOT + sep)) { res.writeHead(403); return res.end('denied'); }
+  try {
+    const data = await readFile(target);
+    res.writeHead(200, { 'content-type': TYPES[extname(target)] || 'application/octet-stream' });
+    res.end(data);
+  } catch {
+    res.writeHead(404);
+    res.end('not found');
+  }
+});
+
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const url = `http://127.0.0.1:${server.address().port}/${HARNESS}`;
+console.log('浏览器 E2E: ' + browser);
+console.log('临时服务:  ' + url + '\n');
+
+child = spawn(browser, [
+  '--headless=new',
+  '--disable-gpu',
+  '--mute-audio',
+  '--no-first-run',
+  '--no-default-browser-check',
+  '--disable-features=Translate',
+  '--user-data-dir=' + join(tmpdir(), 'cannon-goblin-e2e-' + Date.now()),
+  url
+], { stdio: 'ignore' });
+
+setTimeout(() => {
+  console.error('\n❌ 超时：' + TIMEOUT_MS + 'ms 内没有拿到结果');
+  finish(1);
+}, TIMEOUT_MS);

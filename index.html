@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>大炮轰小鬼</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Main Menu -->
+    <div id="screen-menu" class="screen active">
+      <div class="menu-container">
+        <div class="game-title">
+          <div class="title-icon">🎯</div>
+          <h1>大炮轰小鬼</h1>
+          <p class="subtitle">策略棋盘对战游戏</p>
+        </div>
+        <div class="menu-buttons">
+          <button class="menu-btn" onclick="showScreen('local-setup')">
+            <span class="btn-icon">👥</span>
+            <span class="btn-text">本地对局</span>
+            <span class="btn-desc">两人在同一电脑对弈</span>
+          </button>
+          <button class="menu-btn" onclick="showScreen('ai-setup')">
+            <span class="btn-icon">🤖</span>
+            <span class="btn-text">人机对局</span>
+            <span class="btn-desc">选择阵营挑战电脑</span>
+          </button>
+          <button class="menu-btn" onclick="showScreen('online-lobby')">
+            <span class="btn-icon">🌐</span>
+            <span class="btn-text">在线对局</span>
+            <span class="btn-desc">创建或加入房间</span>
+          </button>
+          <button class="menu-btn" onclick="showScreen('rules')">
+            <span class="btn-icon">📖</span>
+            <span class="btn-text">游戏规则</span>
+            <span class="btn-desc">了解玩法与规则</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Game Setup Screen (shared for local/AI) -->
+    <div id="screen-local-setup" class="screen">
+      <div class="setup-container">
+        <h2>本地对局 - 游戏设置</h2>
+        <div class="setup-section">
+          <h3>选择预设地图</h3>
+          <div class="preset-maps" id="preset-maps-local"></div>
+        </div>
+        <div class="setup-section">
+          <h3>自定义设置</h3>
+          <div class="custom-settings">
+            <div class="setting-row">
+              <label>棋盘宽度:</label>
+              <input type="number" id="board-width-local" min="4" max="15" value="6">
+            </div>
+            <div class="setting-row">
+              <label>棋盘高度:</label>
+              <input type="number" id="board-height-local" min="4" max="15" value="6">
+            </div>
+            <div class="setting-row">
+              <label>大炮数量:</label>
+              <input type="number" id="cannon-count-local" min="1" max="10" value="2">
+            </div>
+            <div class="setting-row">
+              <label>小鬼数量:</label>
+              <input type="number" id="ghost-count-local" min="1" max="50" value="18">
+            </div>
+          </div>
+          <button class="action-btn" onclick="showEditor('local')">编辑初始位置</button>
+        </div>
+        <div class="setup-actions">
+          <button class="back-btn" onclick="showScreen('menu')">返回</button>
+          <button class="start-btn" onclick="startLocalGame()">开始游戏</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- AI Setup Screen -->
+    <div id="screen-ai-setup" class="screen">
+      <div class="setup-container">
+        <h2>人机对局 - 游戏设置</h2>
+        <div class="setup-section">
+          <h3>选择阵营</h3>
+          <div class="side-select">
+            <button class="side-btn selected" id="side-cannon" onclick="selectSide('cannon')">
+              <span class="side-icon">💣</span>
+              <span>大炮方</span>
+            </button>
+            <button class="side-btn" id="side-ghost" onclick="selectSide('ghost')">
+              <span class="side-icon">👻</span>
+              <span>小鬼方</span>
+            </button>
+          </div>
+        </div>
+        <div class="setup-section">
+          <h3>选择难度</h3>
+          <div class="difficulty-select">
+            <button class="difficulty-btn" id="diff-easy" onclick="selectDifficulty('easy')">
+              <span class="diff-icon">🌱</span>
+              <span>简单</span>
+              <span class="diff-desc">随机移动</span>
+            </button>
+            <button class="difficulty-btn selected" id="diff-normal" onclick="selectDifficulty('normal')">
+              <span class="diff-icon">⚔️</span>
+              <span>普通</span>
+              <span class="diff-desc">策略移动</span>
+            </button>
+            <button class="difficulty-btn" id="diff-hard" onclick="selectDifficulty('hard')">
+              <span class="diff-icon">💀</span>
+              <span>困难</span>
+              <span class="diff-desc">深度计算</span>
+            </button>
+          </div>
+        </div>
+        <div class="setup-section">
+          <h3>选择预设地图</h3>
+          <div class="preset-maps" id="preset-maps-ai"></div>
+        </div>
+        <div class="setup-section">
+          <h3>自定义设置</h3>
+          <div class="custom-settings">
+            <div class="setting-row">
+              <label>棋盘宽度:</label>
+              <input type="number" id="board-width-ai" min="4" max="15" value="6">
+            </div>
+            <div class="setting-row">
+              <label>棋盘高度:</label>
+              <input type="number" id="board-height-ai" min="4" max="15" value="6">
+            </div>
+            <div class="setting-row">
+              <label>大炮数量:</label>
+              <input type="number" id="cannon-count-ai" min="1" max="10" value="2">
+            </div>
+            <div class="setting-row">
+              <label>小鬼数量:</label>
+              <input type="number" id="ghost-count-ai" min="1" max="50" value="18">
+            </div>
+          </div>
+          <button class="action-btn" onclick="showEditor('ai')">编辑初始位置</button>
+        </div>
+        <div class="setup-actions">
+          <button class="back-btn" onclick="showScreen('menu')">返回</button>
+          <button class="start-btn" onclick="startAIGame()">开始游戏</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Board Editor -->
+    <div id="screen-editor" class="screen">
+      <div class="editor-container">
+        <h2>编辑初始位置</h2>
+        <p class="editor-hint">点击棋盘格子放置棋子，再次点击移除</p>
+        <div class="editor-tools">
+          <button class="tool-btn active" id="tool-cannon" onclick="selectTool('cannon')">💣 放置大炮</button>
+          <button class="tool-btn" id="tool-ghost" onclick="selectTool('ghost')">👻 放置小鬼</button>
+          <button class="tool-btn" id="tool-erase" onclick="selectTool('erase')">🗑️ 擦除</button>
+        </div>
+        <div class="editor-board-wrapper">
+          <div id="editor-board" class="game-board"></div>
+        </div>
+        <div class="editor-info">
+          <span>大炮: <strong id="editor-cannon-count">0</strong></span>
+          <span>小鬼: <strong id="editor-ghost-count">0</strong></span>
+        </div>
+        <div class="setup-actions">
+          <button class="back-btn" onclick="backFromEditor()">返回设置</button>
+          <button class="start-btn" onclick="confirmEditor()">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Online Lobby (WebRTC 直连) -->
+    <div id="screen-online-lobby" class="screen">
+      <div class="lobby-container">
+        <h2>在线对局 · 直连</h2>
+        <p class="lobby-hint">
+          无需服务器：双方交换两段代码即可点对点连接。<br>
+          房主执 💣 大炮方并决定地图，加入方执 👻 小鬼方。
+        </p>
+
+        <div class="lobby-actions" id="lobby-actions">
+          <div class="lobby-card">
+            <h3>我是房主</h3>
+            <p>生成邀请码，发给对手</p>
+            <div class="setting-row">
+              <label>地图:</label>
+              <select id="online-preset"></select>
+            </div>
+            <button class="action-btn" onclick="createRoom()">生成邀请码</button>
+          </div>
+          <div class="lobby-card">
+            <h3>我加入</h3>
+            <p>粘贴房主发来的邀请码</p>
+            <textarea id="offer-input" class="code-box" spellcheck="false"
+                      placeholder="在这里粘贴邀请码…"></textarea>
+            <button class="action-btn" onclick="joinRoom()">生成应答码</button>
+          </div>
+        </div>
+
+        <div id="relay-panel" class="relay-panel" style="display:none;">
+          <p class="relay-hint" id="relay-hint"></p>
+          <textarea id="relay-output" class="code-box" readonly spellcheck="false"></textarea>
+          <div class="relay-actions">
+            <button class="action-btn" onclick="copyRelayCode()">复制这段代码<span id="relay-copied" class="copied-tag"></span></button>
+            <button class="back-btn" onclick="backFromRelay()">取消</button>
+          </div>
+        </div>
+
+        <div id="answer-panel" class="relay-panel" style="display:none;">
+          <p class="relay-hint">把对手回传的应答码粘贴到这里，然后点「连接」。</p>
+          <textarea id="answer-input" class="code-box" spellcheck="false"
+                    placeholder="在这里粘贴应答码…"></textarea>
+          <div class="relay-actions">
+            <button class="action-btn" onclick="finishConnection()">连接对手</button>
+            <button class="back-btn" onclick="backFromRelay()">取消</button>
+          </div>
+        </div>
+
+        <div id="lobby-status" class="lobby-status"></div>
+        <button class="back-btn" onclick="leaveOnline()">返回菜单</button>
+      </div>
+    </div>
+
+    <!-- Game Screen -->
+    <div id="screen-game" class="screen">
+      <div class="game-container">
+        <div class="game-header">
+          <button class="icon-btn" onclick="confirmQuit()">✕</button>
+          <div class="turn-indicator" id="turn-indicator">
+            <span id="turn-text">大炮方回合</span>
+          </div>
+          <div class="game-info-brief">
+            <span id="ghost-remaining">👻 ×18</span>
+            <span id="cannon-remaining">💣 ×2</span>
+          </div>
+        </div>
+        <div class="board-wrapper">
+          <div id="game-board" class="game-board"></div>
+        </div>
+        <div class="game-footer">
+          <div id="game-status" class="game-status"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Game Over Modal -->
+    <div id="game-over-modal" class="modal" style="display:none;">
+      <div class="modal-content">
+        <h2 id="game-over-title">游戏结束</h2>
+        <p id="game-over-message"></p>
+        <div class="modal-actions">
+          <button class="action-btn" onclick="restartGame()">再来一局</button>
+          <button class="back-btn" onclick="backToMenu()">返回菜单</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Rules Screen -->
+    <div id="screen-rules" class="screen">
+      <div class="rules-container">
+        <h2>游戏规则</h2>
+        <div class="rules-content">
+          <section class="rule-section">
+            <h3>🎯 游戏简介</h3>
+            <p>大炮轰小鬼是一款不对称策略棋盘游戏。大炮方拥有强大的远程攻击能力，小鬼方则以数量优势围堵大炮。双方斗智斗勇，看谁能笑到最后！</p>
+          </section>
+          <section class="rule-section">
+            <h3>📋 基本规则</h3>
+            <ul>
+              <li><strong>棋盘：</strong>默认为6×6的网格棋盘，棋子放在交叉点上</li>
+              <li><strong>棋子：</strong>大炮方2枚大炮，小鬼方18枚小鬼</li>
+              <li><strong>先手：</strong>大炮方先手</li>
+              <li><strong>移动：</strong>每回合只能移动一枚己方棋子，横竖走一格到相邻的空位</li>
+            </ul>
+          </section>
+          <section class="rule-section">
+            <h3>💣 大炮吃子规则</h3>
+            <p>大炮吃子需要满足以下条件：</p>
+            <ul>
+              <li>大炮、一个空格、一枚小鬼三者在同一条直线上（横或竖）</li>
+              <li>大炮和小鬼之间刚好隔一个空位</li>
+              <li>满足条件时，大炮跳到小鬼的位置，将该小鬼移出棋盘</li>
+            </ul>
+            <div class="rule-diagram">
+              <p>示意图：💣 → ○ → 👻 = 💣跳到👻位置，👻被移除</p>
+            </div>
+          </section>
+          <section class="rule-section">
+            <h3>👻 小鬼的限制</h3>
+            <p>小鬼不能吃掉大炮，只能通过围堵来限制大炮的行动。小鬼需要配合默契，形成包围圈将大炮困住。</p>
+          </section>
+          <section class="rule-section">
+            <h3>🏆 胜负判定</h3>
+            <ul>
+              <li><strong>大炮方获胜：</strong>当场上小鬼数量小于等于大炮数量时</li>
+              <li><strong>小鬼方获胜：</strong>当所有大炮都被堵死，无法移动时</li>
+            </ul>
+          </section>
+          <section class="rule-section">
+            <h3>💡 策略提示</h3>
+            <ul>
+              <li><strong>大炮方：</strong>利用远程攻击逐步削减小鬼数量，注意保持灵活的移动空间</li>
+              <li><strong>小鬼方：</strong>协调配合，从多个方向包围大炮，限制其活动范围</li>
+            </ul>
+          </section>
+        </div>
+        <button class="back-btn" onclick="showScreen('menu')">返回菜单</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/audio.js"></script>
+  <script src="js/game.js"></script>
+  <script src="js/ai.js"></script>
+  <script src="js/webrtc.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

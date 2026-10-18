@@ -539,6 +539,7 @@ function confirmQuit() {
 let room = null;
 let onlineInitial = null;       // 房主本局采用的初始局面 {width, height, board}
 let onlineHostSide = 'cannon';  // 房主执哪一方；加入方自动取另一方
+let onlineReadyInfo = null;     // 准备界面上的房间号 / 通路，中途换通路时要跟着更新
 
 /** 房主才能决定局面和重开（局面在他手里）。 */
 function isOnlineHost() {
@@ -626,6 +627,10 @@ function roomHandlers() {
         setLobbyStatus('正在寻找房间 ' + status.code + '…');
       } else if (status.phase === 'negotiating') {
         setLobbyStatus('已找到对手，正在尝试直连…');
+      } else if (status.phase === 'transport') {
+        // 半路换通路（典型是直连断了自动改走中继）：界面上的模式得跟着说实话。
+        updateReadyTransport(status.mode);
+        setStatus(status.mode === 'relay' ? '直连中断，已自动切到中转模式' : '已切到直连模式');
       }
     },
     onReady: showReadyScreen,
@@ -637,6 +642,8 @@ function roomHandlers() {
       alert(error.message);
     },
     onClosed: (reason) => {
+      // 还在准备界面（没开局）时也要说清楚，不然用户对着一个点不动的"开始游戏"发呆。
+      if (currentScreen === 'online-ready') updateReadyTransport(null, reason);
       if (gameMode === 'online' && gameState && !gameState.gameOver) setStatus(reason);
     }
   };
@@ -749,8 +756,8 @@ function showReadyScreen(info) {
   // 不能在这里把加入方的站位重置成默认值 —— 房主的 side 消息可能已经到了，会被覆盖掉。
   applyOnlineSide(onlineHostSide);
 
-  document.getElementById('ready-meta').textContent =
-    '房间 ' + info.code + ' · ' + (info.transport === 'p2p' ? '直连模式' : '中转模式');
+  onlineReadyInfo = { code: info.code, transport: info.transport };
+  renderReadyMeta();
   document.getElementById('ready-host-panel').style.display = isHost ? '' : 'none';
   document.getElementById('ready-guest-panel').style.display = isHost ? 'none' : '';
   document.getElementById('ready-start-btn').style.display = isHost ? '' : 'none';
@@ -759,6 +766,23 @@ function showReadyScreen(info) {
   if (isHost) room.send('side', { hostSide: onlineHostSide });
 
   showScreen('online-ready');
+}
+
+/** 准备界面顶部的"房间 + 通路"。通路会在对局中途变（直连断了改中继），所以要能重画。 */
+function renderReadyMeta() {
+  if (!onlineReadyInfo) return;
+  const meta = document.getElementById('ready-meta');
+  meta.textContent = onlineReadyInfo.transport
+    ? '房间 ' + onlineReadyInfo.code + ' · ' + (onlineReadyInfo.transport === 'p2p' ? '直连模式' : '中转模式')
+    : '房间 ' + onlineReadyInfo.code + ' · ' + (onlineReadyInfo.note || '对手已断开');
+}
+
+function updateReadyTransport(mode, note) {
+  if (!onlineReadyInfo) return;
+  if (note) onlineReadyInfo.note = note;
+  if (mode === onlineReadyInfo.transport) return;
+  onlineReadyInfo.transport = mode;
+  renderReadyMeta();
 }
 
 /** 房主开始对局：把选定的站位和局面一起下发给加入方，双方同时进棋盘。 */

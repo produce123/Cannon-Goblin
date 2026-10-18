@@ -31,6 +31,9 @@
   const JOIN_TIMEOUT_MS = 20000;
   const ICE_GATHER_TIMEOUT_MS = 5000;
 
+  // 直连断掉后，加入方等房主宣布"改走中继"的宽限时间；等不到就说明房主也没了。
+  const RELAY_WATCHDOG_MS = 6000;
+
   // 公共 STUN 只用于探路，不中转数据；打不通时由中继兜底，所以不需要 TURN。
   const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -250,6 +253,7 @@
       this._negotiating = false;
       this._joinTimer = null;
       this._leavePeer = false;    // 标记"这次 peer 关闭是我们自己关的"，避免重复报掉线
+      this._relayWatchdog = null; // 加入方等房主宣布改走中继的计时器
       this.sid = null;            // 加入方的会话标识（房主用它定向回话）
       this._guestSid = null;      // 房主记住的当前对手
     }
@@ -349,6 +353,7 @@
       if (this.closed) return;
       // 直连模式下 broker 掉了无所谓，对局继续；中继模式才会真的断。
       if (this.transport === 'relay') {
+        this._leavePairing();
         this.handlers.onClosed?.('中转连接已断开');
       }
     }
@@ -394,7 +399,8 @@
           break;
 
         case 'transport':
-          this._useTransport(message.mode);
+          // 通路由房主单方面决定，只该加入方听；房主自己不接受别人的"决定"。
+          if (this.role === 'guest') this._useTransport(message.mode, true);
           break;
 
         default:
@@ -415,11 +421,12 @@
       this.handlers.onMessage?.(message);
     }
 
-    /** 对手走了（或直连断了）：回到"等人进来"的状态，房间继续开着。 */
+    /** 对手**明确**走了（收到 bye），或两条链路都断了：回到"等人进来"的状态，房间继续开着。 */
     _leavePairing() {
       this._negotiating = false;
       this.transport = null;
       if (this._joinTimer) { clearTimeout(this._joinTimer); this._joinTimer = null; }
+      if (this._relayWatchdog) { clearTimeout(this._relayWatchdog); this._relayWatchdog = null; }
 
       // 主动关闭要标记一下，别把自己的 close 当成"对手掉线"再报一次。
       this._leavePeer = true;
@@ -432,11 +439,33 @@
       }
     }
 
-    /** 直连断掉（对手关页面 / 掉线）时也要放出房间，不然房间就锁死了。 */
+    /** 直连断掉（对手关页面 / 掉线 / 手机锁屏把 WebRTC 冻住）：**不等于对手走了**。
+     *  这里曾经直接解除配对，结果房主还停在准备界面、transport 却没了，
+     *  点「开始游戏」就弹"对手还没有进来"——而对手其实一直在等。 */
     _onPeerClose() {
       if (this.closed || this._leavePeer) return;
+      // 注意判断的是"broker 现在还能不能发消息"，不是"有没有这个对象"：
+      // socket 已经断了但对象还在时，改走中继是发不出去的，那就得照实说断开。
+      const brokerAlive = !!this.mqtt && typeof this.mqtt.isConnected === 'function' && this.mqtt.isConnected();
+
+      if (this.role === 'host' && brokerAlive) {
+        // broker 还活着：改走中继让对局继续（房主决定并广播，两端行为一致）。
+        this._announceTransport('relay');
+        return;
+      }
+
+      if (brokerAlive) {
+        // 加入方无权决定通路，只能等房主的广播；等不到就是房主也断了。
+        this._relayWatchdog = setTimeout(() => {
+          this._relayWatchdog = null;
+          if (this.transport === 'p2p') this.handlers.onClosed?.('与房主的连接已断开');
+        }, RELAY_WATCHDOG_MS);
+        return;
+      }
+
+      // 连 broker 都没了，那才是真的断了：放出房间，别再锁着。
       this._leavePairing();
-      this.handlers.onClosed?.('与对手的直连已断开');
+      this.handlers.onClosed?.('与对手和中转服务器的连接都断了');
     }
 
     async _startNegotiation() {
@@ -491,22 +520,33 @@
     /** 由房主单方面决定并广播，保证两端行为一致。 */
     _announceTransport(mode) {
       this._publish({ type: 'transport', mode });
-      this._useTransport(mode);
+      this._useTransport(mode, true);
     }
 
-    _useTransport(mode) {
-      if (this.transport) return;
+    /**
+     * 定通路。默认只决定一次（first 决定完就不再改）；force 用于半路换通路
+     * （例如直连断了改走中继）——那种情况下界面**不能**被顶回准备页，只提示一句。
+     */
+    _useTransport(mode, force = false) {
       if (mode !== 'p2p' && mode !== 'relay') return;
+      if (!force && this.transport) return;
+      if (this.transport === mode) return;         // 已经是这个通路了，别重复通知
 
+      const first = !this.transport;
       this.transport = mode;
       if (this._joinTimer) { clearTimeout(this._joinTimer); this._joinTimer = null; }
+      if (this._relayWatchdog) { clearTimeout(this._relayWatchdog); this._relayWatchdog = null; }
 
       if (mode === 'relay') {
         try { this.peer?.close(); } catch { /* 已关闭 */ }
         this.peer = null;
       }
 
-      this.handlers.onReady?.({ role: this.role, code: this.code, transport: mode });
+      if (first) {
+        this.handlers.onReady?.({ role: this.role, code: this.code, transport: mode });
+      } else {
+        this.handlers.onStatus?.({ phase: 'transport', mode });
+      }
     }
 
     _publish(message) {

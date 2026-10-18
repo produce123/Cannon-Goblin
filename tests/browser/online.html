@@ -349,7 +349,7 @@ async function playRound(frameA, frameB, mode, label, hostSide = 'cannon') {
  * 对手离开房间后，必须还能用同一个房间号回来。
  * （曾经房主的 _guestSid/transport 一直留着，重进只会被回 busy，人就再也进不来了。）
  */
-async function rejoinRound(frameA, frameB, code, label) {
+async function rejoinRound(frameA, frameB, code, label, mode = 'relay') {
   const docA = frameA.contentDocument;
   const docB = frameB.contentDocument;
   const CA = frameA.contentWindow;
@@ -376,6 +376,29 @@ async function rejoinRound(frameA, frameB, code, label) {
   if (alerts.length) throw new Error(label + ' 重进时弹了错误: ' + alerts.join(' / '));
   if (G(CA, 'room.transport') === null) throw new Error(label + ' 重进后房主没有重新配对');
   say('   双方已回到准备界面，房间号仍是 ' + code);
+
+  // 用户实测的 bug：电脑建房、手机进房、两边都停在准备界面，然后电脑点开始却弹
+  // "对手还没有进来"。原因是直连的 DataChannel 半路断掉（手机锁屏 / ICE 失效）时
+  // room.js 把配对整个解除了，房主的 transport 变回 null，而对手其实还在等。
+  // 正确行为是：broker 还活着就自动改走中继，对局继续。
+  if (mode === 'p2p') {
+    say(label + ' 直连半路断掉：应自动切中继，而不是把对手判成"还没进来"…');
+    const meta = docA.getElementById('ready-meta').textContent;
+    if (meta.indexOf('直连模式') === -1) throw new Error(label + ' 重进后本应是直连模式，实际: ' + meta);
+    G(CA, 'room.peer.close()');    // 模拟手机锁屏 / ICE 失效把 DataChannel 弄断
+
+    await until(() => G(CA, 'room.transport') === 'relay', 10000, '房主应自动改用中继');
+    await until(() => G(CB, 'room.transport') === 'relay', 10000, '加入方应跟着房主改用中继');
+    if (!G(CA, 'room.isReady()')) {
+      throw new Error(label + ' 换通路后房主不再 ready —— 点开始就会弹"对手还没有进来"');
+    }
+    await until(() => docA.getElementById('ready-meta').textContent.indexOf('中转模式') !== -1,
+      5000, '房主准备界面应更新成中转模式');
+    if (!isActive(docA, 'screen-online-ready') || !isActive(docB, 'screen-online-ready')) {
+      throw new Error(label + ' 换通路把界面顶走了（应仍停在准备界面）');
+    }
+    say('   双方都留在准备界面并自动切到中转模式');
+  }
 
   say(label + ' 房主重新开局，重进后的走子仍然同步…');
   docA.getElementById('ready-start-btn').click();
@@ -443,8 +466,8 @@ async function rejoinRound(frameA, frameB, code, label) {
     say('   第三人收到「已经有对手了」，房内对局不受影响');
 
     // ---------- 对手离开后还能用同一个房间号回来（直连） ----------
-    say('【直连】 11) 加入方离开后，用同一个房间号重进…');
-    await rejoinRound(A, B, round1.code, '【直连重进】');
+    say('【直连】 11) 加入方离开后，用同一个房间号重进；重进后直连半路断掉…');
+    await rejoinRound(A, B, round1.code, '【直连重进】', 'p2p');
 
     // ---------- 强制中继模式 ----------
     const relayQuery = (BROKER_QUERY ? BROKER_QUERY + '&' : '') + 'transport=relay';

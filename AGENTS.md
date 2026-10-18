@@ -63,10 +63,19 @@ tests/browser/      无头浏览器 E2E（run.mjs 起临时静态服务 + 内置
   ⚠️ 别再把"房主=大炮方"写死：`playerSide` 由 `app.js` 的 `applyOnlineSide()` 统一算，
   房主自己的选择在 `onlineHostSide`。判断"谁有权开局/重开"要用**房主身份**
   （`isOnlineHost()`），不要用 `playerSide === CANNON`（房主选了小鬼方就会判错人）。
-- **对手离开后房间必须还能再进人。** `room.js` 收到 `bye` 或直连断开时会调
-  `_leavePairing()` 清掉 `_guestSid` / `transport`（**但不动 broker 连接和房间号**），
-  否则房主会一直回 `busy`，对手就再也进不来了。`_onPeerMessage()` 是两条传输路径
-  （DataChannel / MQTT 中继）的统一入口，加"需要同时影响房间状态"的消息时要从这里走。
+- **对手离开后房间必须还能再进人。** 收到 `bye` 时 `room.js` 会调 `_leavePairing()`
+  清掉 `_guestSid` / `transport`（**但不动 broker 连接和房间号**），否则房主会一直回
+  `busy`，对手就再也进不来了。`_onPeerMessage()` 是两条传输路径（DataChannel / MQTT 中继）
+  的统一入口，加"需要同时影响房间状态"的消息时要从这里走。
+  ⚠️ **但"直连断了"不等于"对手走了"**：DataChannel 会因为手机锁屏、ICE 失效而断掉，
+  这时必须改走中继让对局继续（房主的 `_onPeerClose` → `_announceTransport('relay')`），
+  **不能**解除配对 —— 一解除，房主还停在准备界面而 `transport` 已经变回 null，
+  点「开始游戏」就弹"对手还没有进来"，可对手明明一直在等（用户实测过这个 bug）。
+  只有收到 `bye`、或 broker 也一起断了，才走 `_leavePairing()`。
+- **通路可以中途换。** `_useTransport(mode, force)` 的 `force` 用于"直连断了改中继"这类
+  事后改判；换通路时只发 `onStatus({phase:'transport'})` 给界面刷新提示，**不重放
+  `onReady`**，否则对局中途会被顶回准备界面。`transport` 消息只由加入方接受
+  （房主是决定方，它自己也只认自己的决定）。
 - 消息协议（JSON）：信令 `join` / `busy` / `offer` / `answer` / `transport`；
   对局 `side`（房主换边）/ `start`（携带站位 + 棋盘）/ `move` / `restartRequest` / `bye`。
 - **全局只暴露命名空间，不暴露裸全局**：`js/mqtt.js` → `CannonMqtt`，
@@ -122,11 +131,13 @@ E2E_DSF=3 node tests/browser/run.mjs      # 同上，但模拟高分屏手机（
 `tests/browser/online.html`：多个同源 iframe 各加载一份真实 `index.html`，走完
 「建房 → 房间号进房 → 房主改执小鬼方（加入方自动变大炮方且由加入方先走）→ 双方准备界面
 → 房主选地图开局 → 双方走子同步 → 两条重开路径 → 第三人抢号被拒 →
-对手离开后用同一房间号重进 → 强制中继模式再来一遍（含重进）→
+对手离开后用同一房间号重进（重进后直连半路断掉，必须自动切中继且仍停在准备界面）→
+强制中继模式再来一遍（含重进）→
 手机窄屏下棋子与网格交点的对齐 → 本地对局与三档人机各出一手」，
 并收集 iframe 内被吞掉的 async 报错，失败时还会把各页的 alert / 异常 / 状态一起打出来。
-**改动联机、棋盘渲染或界面流程后必须跑它**；它已经捕到过三个真实 bug（见上面的裸全局警告、
-内置 broker 的 CONNACK 忘了套 WebSocket 帧，以及棋盘被 flex 压缩导致手机上棋子错位）。
+**改动联机、棋盘渲染或界面流程后必须跑它**；它已经捕到过四个真实 bug（见上面的裸全局警告、
+内置 broker 的 CONNACK 忘了套 WebSocket 帧、棋盘被 flex 压缩导致手机上棋子错位、
+以及直连断掉时误解除配对导致"对手还没有进来"）。
 
 浏览器 E2E 用 `node:test` 之外的方式跑，所以要单独一条命令（不在 `tests/` 目录里递归执行）。
 

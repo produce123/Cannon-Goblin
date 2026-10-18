@@ -209,6 +209,11 @@
       });
     }
 
+    /** broker 连接现在能不能真的发消息（掉线时 room.js 要靠它决定还能不能改走中继）。 */
+    isConnected() {
+      return this._connected && !!this.ws && this.ws.readyState === 1;
+    }
+
     publish(topic, text) {
       if (!this.ws || this.ws.readyState !== 1) return false;
       try {

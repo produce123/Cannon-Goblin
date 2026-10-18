@@ -306,7 +306,7 @@ function initGameFromCustom() {
 
 function checkAIFirstMove() {
   if (gameMode === 'ai' && gameState.currentTurn !== playerSide) {
-    setTimeout(doAIMove, 500);
+    scheduleAIMove(500);
   }
 }
 
@@ -373,7 +373,7 @@ function handleCellClick(r, c) {
         }
 
         if (gameMode === 'ai' && gameState.currentTurn !== playerSide) {
-          setTimeout(doAIMove, 400);
+          scheduleAIMove(400);
         }
         return;
       }
@@ -399,6 +399,17 @@ function handleCellClick(r, c) {
       setStatus('该棋子无法移动');
     }
   }
+}
+
+/**
+ * 安排电脑走子。困难档会占着主线程算 1.5 秒，所以先把"思考中"画到屏幕上，
+ * 等浏览器真的绘完这一帧（两层 rAF）再开始算，否则看起来就像卡死了。
+ */
+function scheduleAIMove(delay = 500) {
+  setTimeout(() => {
+    setStatus('🤔 电脑思考中…');
+    requestAnimationFrame(() => requestAnimationFrame(doAIMove));
+  }, delay);
 }
 
 function doAIMove() {

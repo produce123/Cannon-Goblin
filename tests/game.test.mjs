@@ -322,7 +322,7 @@ test('三种难度在预设地图上都返回合法走法（双方都测）', ()
   }
 });
 
-test('难度对应预测步数：1 步 / 2 步 / 4 步（用搜索节点数验证）', () => {
+test('难度对应预测步数：简单 1 步、普通 2 步，困难不固定层数但明显更深（用搜索节点数验证）', () => {
   const gs = fromPreset(1, CANNON);
 
   const nodes = {};
@@ -332,15 +332,77 @@ test('难度对应预测步数：1 步 / 2 步 / 4 步（用搜索节点数验�
     nodes[difficulty] = AIPlayer.nodes;
   }
 
-  // 1 步 = 根节点自己比一遍，不递归；2 步和 4 步会递归下去，节点数必须递增
+  // 1 步 = 根节点自己比一遍，不递归；2 步和困难档会递归下去，节点数必须递增
   assert.equal(nodes.easy, 0, '简单模式只预测 1 步：不应有任何递归搜索');
   assert.ok(nodes.normal > nodes.easy, `普通模式(2步)应比简单模式搜得多: ${nodes.normal} > ${nodes.easy}`);
-  assert.ok(nodes.hard > nodes.normal, `困难模式(4步)应比普通模式搜得多: ${nodes.hard} > ${nodes.normal}`);
+  assert.ok(nodes.hard > nodes.normal, `困难模式应比普通模式搜得多: ${nodes.hard} > ${nodes.normal}`);
 
   // 深度参数直接决定搜索规模：同一个局面，4 层的节点数必须明显多于 1 层
   const shallow = AIPlayer.searchMove(gs, CANNON, 1) && AIPlayer.nodes;
   const deep = AIPlayer.searchMove(gs, CANNON, 4) && AIPlayer.nodes;
   assert.ok(deep > shallow * 10, `4 层应比 1 层搜得深得多: ${deep} vs ${shallow}`);
+
+  // 困难档是"在时间预算内能算多深算多深"：实测常规 6 层、简单局面 8 层。
+  // 这里只卡一个留了余量的下限（慢机器上少一层也还算达标），确保没有退化回 4 层。
+  AIPlayer.makeMove(fromPreset(1, CANNON), CANNON, 'hard');
+  assert.ok(AIPlayer.depthReached >= 5,
+    `困难模式应当搜到 5 层以上，实际只到 ${AIPlayer.depthReached} 层`);
+  assert.ok(AIPlayer.depthReached <= 8, `困难模式不该超过 8 层上限，实际 ${AIPlayer.depthReached}`);
+});
+
+test('困难模式在满盘小鬼的局面下也会吃子（回归：曾经因为距离项过大而不吃）', () => {
+  // 8x8 几乎铺满小鬼，大炮站中间，只给它留一条吃子线路：
+  // (3,3) 上方 (2,3) 空、(1,3) 有鬼 → 可以隔空吃掉 (1,3)。
+  // 旧评估函数对每个小鬼累加"离大炮多远"，跳过去吃会让大炮离鬼群更近、
+  // 总分反而掉了，于是困难电脑宁愿在 (6,4)/(6,3) 之间来回走，一手都不吃。
+  const build = () => {
+    const gs = new GameState(8, 8);
+    const cannons = [[3, 3], [3, 5], [6, 4]];
+    for (const [r, c] of cannons) gs.placeCannon(r, c);
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        if (gs.board[r][c] !== EMPTY) continue;
+        if (r === 2 && c === 3) continue;   // 吃子线路上的空位，必须留空
+        gs.placeGhost(r, c);
+      }
+    }
+    gs.currentTurn = CANNON;
+    return gs;
+  };
+
+  const gs = build();
+  assert.ok(gs.countGhosts() >= 20, `这个局面应该有满盘小鬼，实际 ${gs.countGhosts()}`);
+  assert.deepEqual(plain(gs.getCaptureMoves(3, 3)), [{ r: 1, c: 3, capture: true }],
+    '构造的局面里 (3,3) 应当正好能吃 (1,3)');
+  assert.equal(gs.isSideBlocked(CANNON), false, '这个局面不该已经分出胜负');
+
+  const move = AIPlayer.makeMove(build(), CANNON, 'hard');
+  assert.equal(move.to.capture, true, '满盘小鬼时困难电脑也必须吃掉眼前的子，不能原地打转');
+  assert.deepEqual(plain(move.to), { r: 1, c: 3, capture: true });
+});
+
+test('困难模式会连着吃：两连吃的机会必须抓住', () => {
+  // 12 宽的棋盘上摆一条吃子链：(4,4) 吃 (4,6) 落到 (4,6)，再吃 (4,8) 落到 (4,8)，
+  // 两次落点四周都还有空位（不会被反手围死），所以没有理由不吃。
+  const gs = new GameState(12, 12);
+  gs.placeCannon(4, 4);
+  for (const [r, c] of [[4, 6], [4, 8], [11, 0], [11, 1], [10, 0]]) gs.placeGhost(r, c);
+  gs.currentTurn = CANNON;
+
+  assert.deepEqual(plain(gs.getCaptureMoves(4, 4)), [{ r: 4, c: 6, capture: true }], '第一步应当能吃 (4,6)');
+
+  let eaten = 0;
+  for (let i = 0; i < 2 && !gs.gameOver; i++) {
+    gs.currentTurn = CANNON;    // 这里只考大炮的连吃，小鬼那步直接跳过
+    const before = gs.countGhosts();
+    const move = AIPlayer.makeMove(gs, CANNON, 'hard');
+    assert.ok(move, '应当给出走法');
+    assert.equal(move.to.capture, true, `第 ${i + 1} 手有机会吃子，应当吃掉（落在 (${move.to.r},${move.to.c})）`);
+    assert.ok(gs.selectPiece(move.from.r, move.from.c));
+    gs.movePiece(move.to.r, move.to.c);
+    if (gs.countGhosts() < before) eaten++;
+  }
+  assert.equal(eaten, 2, `两连吃应当都吃到，实际 ${eaten}`);
 });
 
 test('简单的 1 步预测也能立刻吃到眼前的小鬼', () => {
